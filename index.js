@@ -22,7 +22,7 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/,'') || 'http
 const ALIEN_COUNT = parseInt(process.env.ALIEN_COUNT || "60", 10);
 
 // ======= Helper to build absolute image URLs =======
-const imgUrl = (id) => `${PUBLIC_BASE_URL}/static/aliens/${id}.png`;
+const imgUrl = (id) => `${PUBLIC_BASE_URL}/static/${id}.png`;
 const ALIENS = Array.from({ length: ALIEN_COUNT }, (_, i) => ({
   id: i + 1,
   image: imgUrl(i + 1)
