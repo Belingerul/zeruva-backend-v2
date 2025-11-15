@@ -10,7 +10,28 @@ const { buildTransferTx } = require("./src/sol");
 
 const app = express();
 app.use(cors({
-  origin: ["https://your-vercel-frontend.vercel.app", "http://localhost:5173"],
+  origin: (origin, cb) => {
+    // allow requests from:
+    // - localhost dev
+    // - v0.dev
+    // - any *.vusercontent.net preview
+    if (!origin) return cb(null, true); // curl / Postman etc.
+
+    const allowed = [
+      "http://localhost:5173",
+      "https://v0.dev"
+    ];
+
+    if (
+      allowed.includes(origin) ||
+      origin.endsWith(".vusercontent.net")
+    ) {
+      return cb(null, true);
+    }
+
+    console.log("❌ Blocked by CORS:", origin);
+    return cb(new Error("Not allowed by CORS"));
+  },
   credentials: true
 }));
 app.use(body.json({ limit: "1mb" }));
