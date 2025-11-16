@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const { nanoid } = require("nanoid");
 const { PublicKey } = require("@solana/web3.js");
 const { buildTransferTx } = require("./src/sol");
+const { initDb, query } = require("./db");
 
 const app = express();
 app.use(cors({
@@ -90,6 +91,16 @@ app.get("/api/health", (_, res) => {
   res.json({ ok: true, admin: ADMIN_WALLET, aliens: ALIEN_COUNT });
 });
 
+app.get("/api/db-health", async (req, res) => {
+  try {
+    const result = await query("SELECT NOW() as now");
+    res.json({ ok: true, now: result.rows[0].now });
+  } catch (err) {
+    console.error("DB health error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get("/api/get-random-aliens", (req, res) => {
   const count = Math.min(parseInt(req.query.count || "16", 10), ALIEN_COUNT);
   const pool = [...ALIENS];
@@ -159,4 +170,12 @@ app.post("/api/buy-spaceship", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Zeruva API running on ${PORT}`));
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => console.log(`✅ Zeruva API running on ${PORT}`));
+  })
+  .catch((err) => {
+    console.error("❌ Failed to initialize DB", err);
+    process.exit(1);
+  });
