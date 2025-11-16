@@ -110,34 +110,150 @@ app.get("/api/get-random-aliens", (req, res) => {
   }
   res.json(pool.slice(0, count));
 });
+app.get("/api/aliens/:wallet", async (req, res) => {
+  try {
+    const { wallet } = req.params;
+    const result = await query(
+      `SELECT * FROM aliens WHERE wallet = $1 ORDER BY id DESC`,
+      [wallet]
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+app.get("/api/ship/:wallet", async (req, res) => {
+  const { wallet } = req.params;
 
-app.post("/api/spin", limitSpin, (req, res) => {
+  try {
+    const user = await query(`SELECT ship_level FROM users WHERE wallet = $1`, [wallet]);
+    const slots = await query(
+      `SELECT s.slot_index, a.*
+       FROM ship_slots s
+       LEFT JOIN aliens a ON a.id = s.alien_fk
+       WHERE s.wallet = $1
+       ORDER BY slot_index`,
+      [wallet]
+    );
+
+    res.json({
+      level: user.rows[0]?.ship_level || 1,
+      slots: slots.rows,
+    });
+  } catch (e) {
+    console.log(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+app.post("/api/upgrade-ship", async (req, res) => {
+  const { wallet, newLevel } = req.body;
+
+  if (!wallet || !newLevel)
+    return res.status(400).json({ error: "Missing fields" });
+
+  try {
+    await query(
+      `UPDATE users
+       SET ship_level = $1
+       WHERE wallet = $2`,
+      [newLevel, wallet]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.log(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/assign-slot", async (req, res) => {
+  const { wallet, slotIndex, alienDbId } = req.body;
+
+  if (!wallet || slotIndex == null || !alienDbId)
+    return res.status(400).json({ error: "Missing fields" });
+
+  try {
+    await query(
+      `INSERT INTO ship_slots (wallet, slot_index, alien_fk)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (wallet, slot_index)
+       DO UPDATE SET alien_fk = $3`,
+      [wallet, slotIndex, alienDbId]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/register", async (req, res) => {
+  const { wallet } = req.body;
+  if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+
+  try {
+    await query(
+      `INSERT INTO users (wallet)
+       VALUES ($1)
+       ON CONFLICT (wallet) DO NOTHING`,
+      [wallet]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/spin", limitSpin, async (req, res) => {
   const { wallet, eggType = "basic" } = req.body || {};
+
+  if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+
   const mod = EGG_MOD[eggType] || EGG_MOD.basic;
   const weights = {
     Common: BASE_WEIGHTS.Common,
     Rare: BASE_WEIGHTS.Rare,
     Epic: BASE_WEIGHTS.Epic + (mod.Epic || 0),
-    Legendary: BASE_WEIGHTS.Legendary + (mod.Legendary || 0)
+    Legendary: BASE_WEIGHTS.Legendary + (mod.Legendary || 0),
   };
+
   const tier = weightedPick(weights);
   const randId = 1 + Math.floor(Math.random() * ALIEN_COUNT);
   const alien = { id: randId, image: imgUrl(randId) };
+  const roi = ROI[tier];
 
   const payload = {
     spinId: nanoid(),
     wallet,
     tier,
-    roi: ROI[tier],
+    roi,
     alien,
-    timestamp: Date.now()
+    timestamp: Date.now(),
   };
-  const serverSignature = crypto.createHmac("sha256", process.env.SERVER_HMAC_SECRET || "dev")
+
+  const signature = crypto.createHmac("sha256", process.env.SERVER_HMAC_SECRET)
     .update(JSON.stringify(payload))
     .digest("hex");
 
-  res.json({ ...payload, serverSignature });
+  // Save alien in DB
+  const result = await query(
+    `INSERT INTO aliens (wallet, alien_id, image, tier, roi)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id`,
+    [wallet, randId, alien.image, tier, roi]
+  );
+
+  res.json({
+    ...payload,
+    db_id: result.rows[0].id, // important for assigning to ship slots
+    serverSignature: signature,
+  });
 });
+
 
 app.post("/api/buy-spaceship", async (req, res) => {
   try {
