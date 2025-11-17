@@ -11,30 +11,19 @@ const { initDb, query } = require("./db");
 
 const app = express();
 app.use(cors({
-  origin: (origin, cb) => {
-    // allow requests from:
-    // - localhost dev
-    // - v0.dev
-    // - any *.vusercontent.net preview
-    if (!origin) return cb(null, true); // curl / Postman etc.
-
-    const allowed = [
-      "http://localhost:5173",
-      "https://v0.dev"
-    ];
-
-    if (
-      allowed.includes(origin) ||
-      origin.endsWith(".vusercontent.net")
-    ) {
-      return cb(null, true);
-    }
-
-    console.log("❌ Blocked by CORS:", origin);
-    return cb(new Error("Not allowed by CORS"));
-  },
+  origin: [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://your-frontend.vercel.app",
+    "https://*.v0.app",
+    "https://*.vusercontent.net"
+  ],
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
 }));
+
 app.use(body.json({ limit: "1mb" }));
 app.use("/static", express.static(path.join(__dirname, "public")));
 
