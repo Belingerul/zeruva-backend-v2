@@ -81,15 +81,6 @@ const LEVEL_SLOTS = {
 };
 
 // ======= Routes =======
-function isProbableSolanaAddress(wallet) {
-  return typeof wallet === 'string' && wallet.length >= 32 && wallet.length <= 44;
-}
-
-// in routes:
-if (!isProbableSolanaAddress(wallet)) {
-  return res.status(400).json({ error: "Invalid wallet" });
-}
-
 app.get("/api/health", (_, res) => {
   res.json({ ok: true, admin: ADMIN_WALLET, aliens: ALIEN_COUNT });
 });
