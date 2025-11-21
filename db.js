@@ -20,7 +20,7 @@ async function initDb() {
       expedition_active BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT NOW()
     );
-  `)
+  `);
 
   // 2) aliens owned by users
   await query(`
@@ -33,7 +33,7 @@ async function initDb() {
       roi DOUBLE PRECISION NOT NULL,
       obtained_at TIMESTAMP DEFAULT NOW()
     );
-  `)
+  `);
 
   // 3) which alien is placed in which ship slot
   await query(`
@@ -43,9 +43,41 @@ async function initDb() {
       slot_index INTEGER NOT NULL,
       alien_fk INTEGER REFERENCES aliens(id)
     );
-  `)
+  `);
 
-  console.log("✅ Database tables ensured/created")
+  // 3a) ensure UNIQUE(wallet, slot_index) for ON CONFLICT (wallet, slot_index)
+  await query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'ship_slots_wallet_slot_unique'
+      ) THEN
+        ALTER TABLE ship_slots
+        ADD CONSTRAINT ship_slots_wallet_slot_unique
+        UNIQUE (wallet, slot_index);
+      END IF;
+    END$$;
+  `);
+
+  // 3b) optional but recommended: each alien only once per wallet
+  await query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'ship_slots_wallet_alien_unique'
+      ) THEN
+        ALTER TABLE ship_slots
+        ADD CONSTRAINT ship_slots_wallet_alien_unique
+        UNIQUE (wallet, alien_fk);
+      END IF;
+    END$$;
+  `);
+
+  console.log("✅ Database tables ensured/created");
 }
 
 module.exports = {
