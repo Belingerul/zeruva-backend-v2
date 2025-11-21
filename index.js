@@ -83,6 +83,65 @@ const LEVEL_SLOTS = {
 // ======= Routes =======
 const BASE_POINTS_PER_DAY = 100; // you can tweak this later
 
+app.get("/api/rewards/:wallet", async (req, res) => {
+  try {
+    const { wallet } = req.params;
+    if (!wallet) {
+      return res.status(400).json({ error: "Missing wallet" });
+    }
+    if (!isProbableSolanaAddress(wallet)) {
+      return res.status(400).json({ error: "Invalid wallet address" });
+    }
+
+    const now = new Date();
+
+    // Get user row
+    let userResult = await query(
+      `SELECT wallet, last_claim_at, pending_points
+       FROM users
+       WHERE wallet = $1`,
+      [wallet]
+    );
+
+    let user = userResult.rows[0];
+
+    if (!user) {
+      // First time user: create with 0 points, last_claim_at = now
+      const insertResult = await query(
+        `INSERT INTO users (wallet, last_claim_at, pending_points)
+         VALUES ($1, $2, 0)
+         RETURNING wallet, last_claim_at, pending_points`,
+        [wallet, now]
+      );
+      user = insertResult.rows[0];
+    }
+
+    // Active aliens on ship
+    const activeResult = await query(
+      `SELECT a.roi
+       FROM ship_slots s
+       JOIN aliens a ON a.id = s.alien_fk
+       WHERE s.wallet = $1`,
+      [wallet]
+    );
+
+    let totalRoiPerDay = 0;
+    for (const row of activeResult.rows) {
+      totalRoiPerDay += Number(row.roi);
+    }
+
+    return res.json({
+      pending_points: Number(user.pending_points || 0),
+      last_claim_at: user.last_claim_at,           // ISO string from DB
+      total_roi_per_day: totalRoiPerDay,           // sum of all active aliens' roi
+      base_points_per_day: BASE_POINTS_PER_DAY,    // so frontend uses same constant
+    });
+  } catch (e) {
+    console.error("GET /api/rewards error", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/claim-rewards", async (req, res) => {
   try {
     const { wallet } = req.body || {};
