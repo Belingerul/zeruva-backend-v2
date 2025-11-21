@@ -74,8 +74,22 @@ function limitSpin(req, res, next) {
     return res.status(429).json({ error: "Too many spins, slow down." });
   next();
 }
+const LEVEL_SLOTS = {
+  1: 2,
+  2: 4,
+  3: 6,
+};
 
 // ======= Routes =======
+function isProbableSolanaAddress(wallet) {
+  return typeof wallet === 'string' && wallet.length >= 32 && wallet.length <= 44;
+}
+
+// in routes:
+if (!isProbableSolanaAddress(wallet)) {
+  return res.status(400).json({ error: "Invalid wallet" });
+}
+
 app.get("/api/health", (_, res) => {
   res.json({ ok: true, admin: ADMIN_WALLET, aliens: ALIEN_COUNT });
 });
@@ -116,7 +130,14 @@ app.get("/api/ship/:wallet", async (req, res) => {
   const { wallet } = req.params;
 
   try {
-    const user = await query(`SELECT ship_level FROM users WHERE wallet = $1`, [wallet]);
+    const user = await query(
+      `SELECT ship_level FROM users WHERE wallet = $1`,
+      [wallet]
+    );
+
+    const level = user.rows[0]?.ship_level || 1;
+    const maxSlots = LEVEL_SLOTS[level] || 2;
+
     const slots = await query(
       `SELECT s.slot_index, a.*
        FROM ship_slots s
@@ -126,15 +147,36 @@ app.get("/api/ship/:wallet", async (req, res) => {
       [wallet]
     );
 
+    const slotArray = [];
+    for (let i = 0; i < maxSlots; i++) {
+      const found = slots.rows.find((row) => row.slot_index === i);
+      if (found && found.id) {
+        slotArray.push({
+          slot_index: i,
+          alien: {
+            id:       found.id,
+            alien_id: found.alien_id,
+            image:    found.image,
+            tier:     found.tier,
+            roi:      Number(found.roi),
+          },
+        });
+      } else {
+        slotArray.push({ slot_index: i, alien: null });
+      }
+    }
+
     res.json({
-      level: user.rows[0]?.ship_level || 1,
-      slots: slots.rows,
+      level,
+      maxSlots,
+      slots: slotArray,
     });
   } catch (e) {
     console.log(e);
     res.status(500).json({ error: e.message });
   }
 });
+
 app.post("/api/upgrade-ship", async (req, res) => {
   const { wallet, newLevel } = req.body;
 
@@ -170,6 +212,30 @@ app.post("/api/assign-slot", async (req, res) => {
        DO UPDATE SET alien_fk = $3`,
       [wallet, slotIndex, alienDbId]
     );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+app.post("/api/unassign-slot", async (req, res) => {
+  const { wallet, alienDbId } = req.body;
+
+  if (!wallet || !alienDbId)
+    return res.status(400).json({ error: "Missing fields" });
+
+  try {
+    const result = await query(
+      `DELETE FROM ship_slots
+       WHERE wallet = $1 AND alien_fk = $2
+       RETURNING id`,
+      [wallet, alienDbId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "No such slot assignment" });
+    }
 
     res.json({ ok: true });
   } catch (e) {
