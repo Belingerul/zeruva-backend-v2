@@ -13,14 +13,42 @@ async function query(text, params) {
 // This will be used to create tables on startup
 async function initDb() {
   // 1) users table
-  await query(`
-    CREATE TABLE IF NOT EXISTS users (
-      wallet TEXT PRIMARY KEY,
-      ship_level INTEGER DEFAULT 1,
-      expedition_active BOOLEAN DEFAULT FALSE,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
+await query(`
+  CREATE TABLE IF NOT EXISTS users (
+    wallet TEXT PRIMARY KEY,
+    ship_level INTEGER DEFAULT 1,
+    expedition_active BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW()
+  );
+`);
+
+// 1a) ensure last_claim_at column exists
+await query(`
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'users' AND column_name = 'last_claim_at'
+    ) THEN
+      ALTER TABLE users
+      ADD COLUMN last_claim_at TIMESTAMP DEFAULT NOW();
+    END IF;
+  END$$;
+`);
+
+// 1b) ensure pending_points column exists
+await query(`
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'users' AND column_name = 'pending_points'
+    ) THEN
+      ALTER TABLE users
+      ADD COLUMN pending_points DOUBLE PRECISION DEFAULT 0;
+    END IF;
+  END$$;
+`);
 
   // 2) aliens owned by users
   await query(`
