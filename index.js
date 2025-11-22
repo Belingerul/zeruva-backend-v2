@@ -79,6 +79,14 @@ const LEVEL_SLOTS = {
   2: 4,
   3: 6,
 };
+// ======= Validate Solana address (basic check) =======
+function isProbableSolanaAddress(address) {
+  return (
+    typeof address === "string" &&
+    address.length >= 32 &&
+    address.length <= 44
+  );
+}
 
 // ======= Routes =======
 const BASE_POINTS_PER_DAY = 100; // you can tweak this later
