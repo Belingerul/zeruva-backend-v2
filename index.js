@@ -39,14 +39,36 @@ const ALIENS = Array.from({ length: ALIEN_COUNT }, (_, i) => ({
   image: imgUrl(i + 1)
 }));
 
-// ======= Game configuration =======
-const BASE_WEIGHTS = { Common: 60, Rare: 25, Epic: 10, Legendary: 5 };
-const EGG_MOD = {
-  basic: { Epic: 0, Legendary: 0 },
-  rare: { Epic: 10, Legendary: 5 },
-  ultra: { Epic: 25, Legendary: 10 }
+const NOTHING_IMAGE = `${PUBLIC_BASE_URL}/static/nothing.png`;
+
+// ======= Game configuration (dollar-per-day model) =======
+
+// Base weights now include a "Nothing" outcome: alien with 0 $/day
+const BASE_WEIGHTS = {
+  Nothing: 20,   // 20% weight -> 0$/day alien
+  Common: 60,
+  Rare:   25,
+  Epic:   10,
+  Legendary: 5,
 };
-const ROI = { Common: 0.02, Rare: 0.05, Epic: 0.08, Legendary: 0.10 };
+
+// Egg modifiers still boost Epic / Legendary chances.
+// "Nothing", Common, Rare stay unchanged by egg type (for now).
+const EGG_MOD = {
+  basic: { Epic: 0,  Legendary: 0 },
+  rare:  { Epic: 10, Legendary: 5 },
+  ultra: { Epic: 25, Legendary: 10 },
+};
+
+// Daily payout in “dollars per day” for each tier.
+// This replaces the old percentage ROI (0.02–0.10).
+const DAILY_REWARD = {
+  Nothing:   0,  // $0 / day
+  Common:    2,  // $2 / day
+  Rare:      5,  // $5 / day
+  Epic:      8,  // $8 / day
+  Legendary: 10, // $10 / day (max)
+};
 
 // ======= Weighted random =======
 function weightedPick(weights) {
@@ -89,7 +111,7 @@ function isProbableSolanaAddress(address) {
 }
 
 // ======= Routes =======
-const BASE_POINTS_PER_DAY = 100; // you can tweak this later
+const BASE_POINTS_PER_DAY = 1; // you can tweak this later
 
 app.get("/api/rewards/:wallet", async (req, res) => {
   try {
@@ -444,29 +466,60 @@ app.post("/api/spin", limitSpin, async (req, res) => {
 
   if (!wallet) return res.status(400).json({ error: "Missing wallet" });
 
+  // Apply egg modifiers
   const mod = EGG_MOD[eggType] || EGG_MOD.basic;
+
+  // Include "Nothing" in the roulette
   const weights = {
-    Common: BASE_WEIGHTS.Common,
-    Rare: BASE_WEIGHTS.Rare,
-    Epic: BASE_WEIGHTS.Epic + (mod.Epic || 0),
+    Nothing:   BASE_WEIGHTS.Nothing,
+    Common:    BASE_WEIGHTS.Common,
+    Rare:      BASE_WEIGHTS.Rare,
+    Epic:      BASE_WEIGHTS.Epic + (mod.Epic || 0),
     Legendary: BASE_WEIGHTS.Legendary + (mod.Legendary || 0),
   };
 
   const tier = weightedPick(weights);
-  const randId = 1 + Math.floor(Math.random() * ALIEN_COUNT);
-  const alien = { id: randId, image: imgUrl(randId) };
-  const roi = ROI[tier];
 
-  const payload = {
+  // Decide ROI (dollars/day or % depending on your model)
+  const roi = (typeof DAILY_REWARD !== "undefined" && DAILY_REWARD[tier] !== undefined)
+    ? DAILY_REWARD[tier]
+    : ROI[tier];
+
+  // BASE payload (same shape for all outcomes)
+  const basePayload = {
     spinId: nanoid(),
     wallet,
     tier,
     roi,
-    alien,
     timestamp: Date.now(),
   };
 
-  const signature = crypto.createHmac("sha256", process.env.SERVER_HMAC_SECRET)
+  // Special case: Nothing → show image, DO NOT insert in DB
+  if (tier === "Nothing") {
+    const alien = { id: null, image: NOTHING_IMAGE };
+
+    const payload = { ...basePayload, alien };
+
+    const signature = crypto
+      .createHmac("sha256", process.env.SERVER_HMAC_SECRET)
+      .update(JSON.stringify(payload))
+      .digest("hex");
+
+    return res.json({
+      ...payload,
+      db_id: null,               // no DB row for Nothing
+      serverSignature: signature,
+    });
+  }
+
+  // Normal case: real alien gets saved to DB and appears in hangar
+  const randId = 1 + Math.floor(Math.random() * ALIEN_COUNT);
+  const alien = { id: randId, image: imgUrl(randId) };
+
+  const payload = { ...basePayload, alien };
+
+  const signature = crypto
+    .createHmac("sha256", process.env.SERVER_HMAC_SECRET)
     .update(JSON.stringify(payload))
     .digest("hex");
 
@@ -480,10 +533,11 @@ app.post("/api/spin", limitSpin, async (req, res) => {
 
   res.json({
     ...payload,
-    db_id: result.rows[0].id, // important for assigning to ship slots
+    db_id: result.rows[0].id,    // used by hangar / ship assignment
     serverSignature: signature,
   });
 });
+
 
 
 app.post("/api/buy-spaceship", async (req, res) => {
