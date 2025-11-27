@@ -479,13 +479,8 @@ app.post("/api/spin", limitSpin, async (req, res) => {
   };
 
   const tier = weightedPick(weights);
+  const roi = ROI[tier] ?? 0; // dollars per day
 
-  // Decide ROI (dollars/day or % depending on your model)
-  const roi = (typeof DAILY_REWARD !== "undefined" && DAILY_REWARD[tier] !== undefined)
-    ? DAILY_REWARD[tier]
-    : ROI[tier];
-
-  // BASE payload (same shape for all outcomes)
   const basePayload = {
     spinId: nanoid(),
     wallet,
@@ -494,7 +489,7 @@ app.post("/api/spin", limitSpin, async (req, res) => {
     timestamp: Date.now(),
   };
 
-  // Special case: Nothing → show image, DO NOT insert in DB
+  // Special case: Nothing → show image, but DO NOT save to DB
   if (tier === "Nothing") {
     const alien = { id: null, image: NOTHING_IMAGE };
 
@@ -507,12 +502,12 @@ app.post("/api/spin", limitSpin, async (req, res) => {
 
     return res.json({
       ...payload,
-      db_id: null,               // no DB row for Nothing
+      db_id: null, // no DB row
       serverSignature: signature,
     });
   }
 
-  // Normal case: real alien gets saved to DB and appears in hangar
+  // Normal case: real alien stored in DB and appears in hangar
   const randId = 1 + Math.floor(Math.random() * ALIEN_COUNT);
   const alien = { id: randId, image: imgUrl(randId) };
 
@@ -523,7 +518,6 @@ app.post("/api/spin", limitSpin, async (req, res) => {
     .update(JSON.stringify(payload))
     .digest("hex");
 
-  // Save alien in DB
   const result = await query(
     `INSERT INTO aliens (wallet, alien_id, image, tier, roi)
      VALUES ($1, $2, $3, $4, $5)
@@ -533,7 +527,7 @@ app.post("/api/spin", limitSpin, async (req, res) => {
 
   res.json({
     ...payload,
-    db_id: result.rows[0].id,    // used by hangar / ship assignment
+    db_id: result.rows[0].id,
     serverSignature: signature,
   });
 });
