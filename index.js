@@ -479,7 +479,7 @@ app.post("/api/spin", limitSpin, async (req, res) => {
   };
 
   const tier = weightedPick(weights);
-  const roi = ROI[tier] ?? 0; // dollars per day
+  const roi = DAILY_REWARD[tier] ?? 0; // dollars per day
 
   const basePayload = {
     spinId: nanoid(),
