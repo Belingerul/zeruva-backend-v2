@@ -36,16 +36,35 @@ await query(`
   END$$;
 `);
 
-// 1b) ensure pending_points column exists
+// 1b) ensure total_claimed_points column exists (NUMERIC for high precision)
 await query(`
   DO $$
   BEGIN
     IF NOT EXISTS (
       SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'users' AND column_name = 'pending_points'
+      WHERE table_name = 'users' AND column_name = 'total_claimed_points'
     ) THEN
       ALTER TABLE users
-      ADD COLUMN pending_points DOUBLE PRECISION DEFAULT 0;
+      ADD COLUMN total_claimed_points NUMERIC(30, 10) DEFAULT 0;
+    END IF;
+  END$$;
+`);
+
+// 1c) migrate pending_points to total_claimed_points if pending_points exists
+await query(`
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'users' AND column_name = 'pending_points'
+    ) AND EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name = 'users' AND column_name = 'total_claimed_points'
+    ) THEN
+      UPDATE users
+      SET total_claimed_points = COALESCE(total_claimed_points, 0) + COALESCE(pending_points, 0)
+      WHERE pending_points IS NOT NULL AND pending_points > 0;
+      ALTER TABLE users DROP COLUMN IF EXISTS pending_points;
     END IF;
   END$$;
 `);
