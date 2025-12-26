@@ -49,20 +49,6 @@ await query(`
     END IF;
   END$$;
 `);
-// 1c) ensure total_claimed_points column exists
-await query(`
-  DO $$
-  BEGIN
-    IF NOT EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'users' AND column_name = 'total_claimed_points'
-    ) THEN
-      ALTER TABLE users
-      ADD COLUMN total_claimed_points DECIMAL(20, 8) DEFAULT 0;
-    END IF;
-  END$$;
-`);
-
   // 2) aliens owned by users
   await query(`
     CREATE TABLE IF NOT EXISTS aliens (
