@@ -116,177 +116,115 @@ const BASE_POINTS_PER_DAY = 1; // you can tweak this later
 app.get("/api/rewards/:wallet", async (req, res) => {
   try {
     const { wallet } = req.params;
+
     if (!wallet) {
-      return res.status(400).json({ error: "Missing wallet" });
-    }
-    if (!isProbableSolanaAddress(wallet)) {
-      return res.status(400).json({ error: "Invalid wallet address" });
+      return res.status(400).json({ error: "Wallet is required" });
     }
 
-    const now = new Date();
-
-    // Get user row
-    let userResult = await query(
-      `SELECT wallet, last_claim_at, pending_points
-       FROM users
-       WHERE wallet = $1`,
+    const result = await query(
+      `
+      SELECT wallet, last_claim_at, total_claimed_points
+      FROM users
+      WHERE wallet = $1
+      `,
       [wallet]
     );
 
-    let user = userResult.rows[0];
-
-    if (!user) {
-      // First time user: create with 0 points, last_claim_at = now
-      const insertResult = await query(
-        `INSERT INTO users (wallet, last_claim_at, pending_points)
-         VALUES ($1, $2, 0)
-         RETURNING wallet, last_claim_at, pending_points`,
-        [wallet, now]
-      );
-      user = insertResult.rows[0];
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
     }
 
-    // Active aliens on ship
-    const activeResult = await query(
-      `SELECT a.roi
-       FROM ship_slots s
-       JOIN aliens a ON a.id = s.alien_fk
-       WHERE s.wallet = $1`,
-      [wallet]
-    );
+    const user = result.rows[0];
 
-    let totalRoiPerDay = 0;
-    for (const row of activeResult.rows) {
-      totalRoiPerDay += Number(row.roi);
-    }
+    // You already have this logic somewhere — reuse it
+    const totalRoiPerDay = await getUserTotalRoi(wallet);
 
     return res.json({
-      pending_points: Number(user.pending_points || 0),
-      last_claim_at: user.last_claim_at,           // ISO string from DB
-      total_roi_per_day: totalRoiPerDay,           // sum of all active aliens' roi
-      base_points_per_day: BASE_POINTS_PER_DAY,    // so frontend uses same constant
+      wallet: user.wallet,
+      total_claimed_points: Number(user.total_claimed_points || 0),
+      last_claim_at: user.last_claim_at,
+      total_roi_per_day: totalRoiPerDay,
+      base_points_per_day: BASE_POINTS_PER_DAY
     });
-  } catch (e) {
-    console.error("GET /api/rewards error", e);
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error("GET /api/rewards error:", err);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 app.post("/api/claim-rewards", async (req, res) => {
   try {
-    const { wallet } = req.body || {};
-    if (!wallet) {
-      return res.status(400).json({ error: "Missing wallet" });
-    }
-    if (!isProbableSolanaAddress(wallet)) {
-      return res.status(400).json({ error: "Invalid wallet address" });
+    const { wallet, calculatedValue } = req.body || {};
+
+    if (!wallet || typeof calculatedValue !== "number") {
+      return res.status(400).json({ error: "Invalid request body" });
     }
 
-    const now = new Date();
-
-    // Get or create user row
-    let userResult = await query(
-      `SELECT wallet, last_claim_at, pending_points
-       FROM users
-       WHERE wallet = $1`,
+    const result = await query(
+      `
+      SELECT wallet, last_claim_at, total_claimed_points
+      FROM users
+      WHERE wallet = $1
+      `,
       [wallet]
     );
 
-    let user = userResult.rows[0];
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
 
-    if (!user) {
-      // First time: create user, no rewards yet
-      const insertResult = await query(
-        `INSERT INTO users (wallet, last_claim_at, pending_points)
-         VALUES ($1, $2, 0)
-         RETURNING wallet, last_claim_at, pending_points`,
-        [wallet, now]
-      );
-      user = insertResult.rows[0];
+    const user = result.rows[0];
 
-      return res.json({
-        claimed: 0,
-        total_points: 0,
-        message: "First time claim, starting timer now.",
+    const nowMs = Date.now();
+    const lastMs = new Date(user.last_claim_at).getTime();
+
+    if (isNaN(lastMs) || nowMs <= lastMs) {
+      return res.status(400).json({ error: "Invalid claim timing" });
+    }
+
+    const elapsedSeconds = (nowMs - lastMs) / 1000;
+
+    const totalRoiPerDay = await getUserTotalRoi(wallet);
+    const earningsPerSecond = totalRoiPerDay / 86400;
+
+    const newlyEarned = elapsedSeconds * earningsPerSecond;
+    const expectedTotal =
+      Number(user.total_claimed_points) + newlyEarned;
+
+    // --- Anti-cheat validation ---
+    const tolerance = 0.01; // allows tiny float drift
+
+    if (Math.abs(calculatedValue - expectedTotal) > tolerance) {
+      return res.status(403).json({
+        success: false,
+        message: "Validation failed"
       });
     }
 
-    const lastClaim = user.last_claim_at ? new Date(user.last_claim_at) : null;
-    if (!lastClaim) {
-      // If somehow null, just set it now without giving points
-      await query(
-        `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
-        [now, wallet]
-      );
-      return res.json({
-        claimed: 0,
-        total_points: Number(user.pending_points || 0),
-        message: "Initialized claim timer.",
-      });
-    }
-
-    const diffMs = now.getTime() - lastClaim.getTime();
-    const diffDays = diffMs / (1000 * 60 * 60 * 24);
-
-    if (diffDays <= 0) {
-      return res.json({
-        claimed: 0,
-        total_points: Number(user.pending_points || 0),
-        message: "No time has passed since last claim.",
-      });
-    }
-
-    // Active aliens on ship
-    const activeResult = await query(
-      `SELECT a.roi
-       FROM ship_slots s
-       JOIN aliens a ON a.id = s.alien_fk
-       WHERE s.wallet = $1`,
-      [wallet]
+    // --- Atomic update ---
+    await query(
+      `
+      UPDATE users
+      SET total_claimed_points = $1,
+          last_claim_at = $2
+      WHERE wallet = $3
+      `,
+      [expectedTotal, new Date(nowMs), wallet]
     );
-
-    if (activeResult.rows.length === 0) {
-      // No active aliens → just advance timer
-      await query(
-        `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
-        [now, wallet]
-      );
-      return res.json({
-        claimed: 0,
-        total_points: Number(user.pending_points || 0),
-        message: "No active aliens on ship.",
-      });
-    }
-
-    let totalRoiPerDay = 0;
-    for (const row of activeResult.rows) {
-      totalRoiPerDay += Number(row.roi);
-    }
-
-    const reward = totalRoiPerDay * diffDays * BASE_POINTS_PER_DAY;
-
-    const updateResult = await query(
-      `UPDATE users
-       SET pending_points = pending_points + $1,
-           last_claim_at = $2
-       WHERE wallet = $3
-       RETURNING pending_points`,
-      [reward, now, wallet]
-    );
-
-    const totalPoints = Number(updateResult.rows[0].pending_points);
 
     return res.json({
-      claimed: reward,
-      total_points: totalPoints,
-      days_since_last_claim: diffDays,
-      total_roi_per_day: totalRoiPerDay,
+      success: true,
+      claimedAmount: newlyEarned,
+      totalClaimedPoints: expectedTotal,
+      lastClaimTimestamp: new Date(nowMs).toISOString()
     });
-  } catch (e) {
-    console.error("POST /api/claim-rewards error", e);
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error("POST /api/claim-rewards error:", err);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 app.get("/api/health", (_, res) => {
   res.json({ ok: true, admin: ADMIN_WALLET, aliens: ALIEN_COUNT });
