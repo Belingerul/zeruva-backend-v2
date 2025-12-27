@@ -118,8 +118,25 @@ function calculateUnclaimedEarnings(lastClaimAt, totalRoiPerDay, now) {
   const lastClaim = new Date(lastClaimAt);
   const diffMs = now.getTime() - lastClaim.getTime();
   if (diffMs <= 0) return 0;
-  const diffDays = diffMs / (1000 * 60 * 60 * 24);
-  return totalRoiPerDay * diffDays * BASE_POINTS_PER_DAY;
+  const elapsedSeconds = diffMs / 1000;
+  const earningsPerSecond = (totalRoiPerDay * BASE_POINTS_PER_DAY) / 86400;
+  const earnings = elapsedSeconds * earningsPerSecond;
+  return Math.round(earnings * 1000000) / 1000000;
+}
+
+async function calculateCurrentROI(wallet) {
+  const activeResult = await query(
+    `SELECT a.roi
+     FROM ship_slots s
+     JOIN aliens a ON a.id = s.alien_fk
+     WHERE s.wallet = $1`,
+    [wallet]
+  );
+  let totalRoiPerDay = 0;
+  for (const row of activeResult.rows) {
+    totalRoiPerDay += Number(row.roi);
+  }
+  return totalRoiPerDay;
 }
 
 app.get("/api/rewards/:wallet", async (req, res) => {
@@ -153,18 +170,7 @@ app.get("/api/rewards/:wallet", async (req, res) => {
       user = insertResult.rows[0];
     }
 
-    const activeResult = await query(
-      `SELECT a.roi
-       FROM ship_slots s
-       JOIN aliens a ON a.id = s.alien_fk
-       WHERE s.wallet = $1`,
-      [wallet]
-    );
-
-    let totalRoiPerDay = 0;
-    for (const row of activeResult.rows) {
-      totalRoiPerDay += Number(row.roi);
-    }
+    const totalRoiPerDay = await calculateCurrentROI(wallet);
 
     const unclaimedEarnings = calculateUnclaimedEarnings(
       user.last_claim_at,
@@ -220,18 +226,7 @@ app.post("/api/claim-rewards", async (req, res) => {
       });
     }
 
-    const activeResult = await query(
-      `SELECT a.roi
-       FROM ship_slots s
-       JOIN aliens a ON a.id = s.alien_fk
-       WHERE s.wallet = $1`,
-      [wallet]
-    );
-
-    let totalRoiPerDay = 0;
-    for (const row of activeResult.rows) {
-      totalRoiPerDay += Number(row.roi);
-    }
+    const totalRoiPerDay = await calculateCurrentROI(wallet);
 
     const serverEarnings = calculateUnclaimedEarnings(
       user.last_claim_at,
@@ -401,6 +396,60 @@ app.post("/api/assign-slot", async (req, res) => {
     return res.status(400).json({ error: "Missing fields" });
 
   try {
+    await query("BEGIN");
+    
+    const now = new Date();
+    const userResult = await query(
+      `SELECT last_claim_at, total_claimed_points
+       FROM users
+       WHERE wallet = $1`,
+      [wallet]
+    );
+    
+    let user = userResult.rows[0];
+    if (!user) {
+      await query(
+        `INSERT INTO users (wallet, last_claim_at, total_claimed_points)
+         VALUES ($1, $2, 0)
+         ON CONFLICT (wallet) DO NOTHING
+         RETURNING last_claim_at, total_claimed_points`,
+        [wallet, now]
+      );
+      const newUserResult = await query(
+        `SELECT last_claim_at, total_claimed_points
+         FROM users WHERE wallet = $1`,
+        [wallet]
+      );
+      user = newUserResult.rows[0];
+    }
+
+    const oldROI = await calculateCurrentROI(wallet);
+    
+    if (oldROI > 0 && user.last_claim_at) {
+      const earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
+      if (earnings > 0) {
+        await query(
+          `UPDATE users
+           SET total_claimed_points = total_claimed_points + $1,
+               last_claim_at = $2
+           WHERE wallet = $3`,
+          [earnings, now, wallet]
+        );
+      } else {
+        await query(
+          `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
+          [now, wallet]
+        );
+      }
+    } else {
+      if (!user.last_claim_at) {
+        await query(
+          `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
+          [now, wallet]
+        );
+      }
+    }
+
     await query(
       `INSERT INTO ship_slots (wallet, slot_index, alien_fk)
        VALUES ($1, $2, $3)
@@ -409,8 +458,10 @@ app.post("/api/assign-slot", async (req, res) => {
       [wallet, slotIndex, alienDbId]
     );
 
+    await query("COMMIT");
     res.json({ ok: true });
   } catch (e) {
+    await query("ROLLBACK").catch(() => {});
     console.error(e);
     res.status(500).json({ error: e.message });
   }
@@ -422,6 +473,49 @@ app.post("/api/unassign-slot", async (req, res) => {
     return res.status(400).json({ error: "Missing fields" });
 
   try {
+    await query("BEGIN");
+
+    const now = new Date();
+    const userResult = await query(
+      `SELECT last_claim_at, total_claimed_points
+       FROM users
+       WHERE wallet = $1`,
+      [wallet]
+    );
+    
+    let user = userResult.rows[0];
+    if (!user) {
+      await query("ROLLBACK");
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const oldROI = await calculateCurrentROI(wallet);
+    
+    if (oldROI > 0 && user.last_claim_at) {
+      const earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
+      if (earnings > 0) {
+        await query(
+          `UPDATE users
+           SET total_claimed_points = total_claimed_points + $1,
+               last_claim_at = $2
+           WHERE wallet = $3`,
+          [earnings, now, wallet]
+        );
+      } else {
+        await query(
+          `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
+          [now, wallet]
+        );
+      }
+    } else {
+      if (!user.last_claim_at) {
+        await query(
+          `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
+          [now, wallet]
+        );
+      }
+    }
+
     const result = await query(
       `DELETE FROM ship_slots
        WHERE wallet = $1 AND alien_fk = $2
@@ -430,11 +524,14 @@ app.post("/api/unassign-slot", async (req, res) => {
     );
 
     if (result.rowCount === 0) {
+      await query("ROLLBACK");
       return res.status(404).json({ error: "No such slot assignment" });
     }
 
+    await query("COMMIT");
     res.json({ ok: true });
   } catch (e) {
+    await query("ROLLBACK").catch(() => {});
     console.error(e);
     res.status(500).json({ error: e.message });
   }
