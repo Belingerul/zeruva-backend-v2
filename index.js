@@ -261,7 +261,7 @@ app.post("/api/claim-rewards", async (req, res) => {
 
     const updateResult = await query(
       `UPDATE users
-       SET total_claimed_points = total_claimed_points + $1,
+       SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
            last_claim_at = $2
        WHERE wallet = $3
        RETURNING total_claimed_points`,
@@ -425,30 +425,19 @@ app.post("/api/assign-slot", async (req, res) => {
 
     const oldROI = await calculateCurrentROI(wallet);
     
+    let earnings = 0;
     if (oldROI > 0 && user.last_claim_at) {
-      const earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
-      if (earnings > 0) {
-        await query(
-          `UPDATE users
-           SET total_claimed_points = total_claimed_points + $1,
-               last_claim_at = $2
-           WHERE wallet = $3`,
-          [earnings, now, wallet]
-        );
-      } else {
-        await query(
-          `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
-          [now, wallet]
-        );
-      }
-    } else {
-      if (!user.last_claim_at) {
-        await query(
-          `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
-          [now, wallet]
-        );
-      }
+      earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
+      if (earnings < 0) earnings = 0;
     }
+    
+    await query(
+      `UPDATE users
+       SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
+           last_claim_at = $2
+       WHERE wallet = $3`,
+      [earnings, now, wallet]
+    );
 
     await query(
       `INSERT INTO ship_slots (wallet, slot_index, alien_fk)
@@ -491,30 +480,19 @@ app.post("/api/unassign-slot", async (req, res) => {
 
     const oldROI = await calculateCurrentROI(wallet);
     
+    let earnings = 0;
     if (oldROI > 0 && user.last_claim_at) {
-      const earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
-      if (earnings > 0) {
-        await query(
-          `UPDATE users
-           SET total_claimed_points = total_claimed_points + $1,
-               last_claim_at = $2
-           WHERE wallet = $3`,
-          [earnings, now, wallet]
-        );
-      } else {
-        await query(
-          `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
-          [now, wallet]
-        );
-      }
-    } else {
-      if (!user.last_claim_at) {
-        await query(
-          `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
-          [now, wallet]
-        );
-      }
+      earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
+      if (earnings < 0) earnings = 0;
     }
+    
+    await query(
+      `UPDATE users
+       SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
+           last_claim_at = $2
+       WHERE wallet = $3`,
+      [earnings, now, wallet]
+    );
 
     const result = await query(
       `DELETE FROM ship_slots
