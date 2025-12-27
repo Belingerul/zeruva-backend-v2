@@ -200,80 +200,90 @@ app.post("/api/claim-rewards", async (req, res) => {
       return res.status(400).json({ error: "Invalid wallet address" });
     }
 
-    const now = new Date();
+    await query("BEGIN");
 
-    let userResult = await query(
-      `SELECT wallet, last_claim_at, total_claimed_points
-       FROM users
-       WHERE wallet = $1`,
-      [wallet]
-    );
+    try {
+      const now = new Date();
 
-    let user = userResult.rows[0];
-
-    if (!user) {
-      const insertResult = await query(
-        `INSERT INTO users (wallet, last_claim_at, total_claimed_points)
-         VALUES ($1, $2, 0)
-         RETURNING wallet, last_claim_at, total_claimed_points`,
-        [wallet, now]
+      let userResult = await query(
+        `SELECT wallet, last_claim_at, total_claimed_points
+         FROM users
+         WHERE wallet = $1`,
+        [wallet]
       );
-      user = insertResult.rows[0];
-      return res.json({
-        claimed: 0,
-        total_claimed_points: 0,
-        message: "First time claim, starting timer now.",
-      });
-    }
 
-    const totalRoiPerDay = await calculateCurrentROI(wallet);
+      let user = userResult.rows[0];
 
-    const serverEarnings = calculateUnclaimedEarnings(
-      user.last_claim_at,
-      totalRoiPerDay,
-      now
-    );
-
-    if (expected_earnings !== undefined && expected_earnings !== null) {
-      const expectedNum = Number(expected_earnings);
-      const diff = Math.abs(serverEarnings - expectedNum);
-      if (diff > 0.01) {
-        return res.status(400).json({
-          error: "Earnings mismatch",
-          server_calculated: serverEarnings,
-          client_expected: expectedNum,
-          tolerance: 0.01,
+      if (!user) {
+        const insertResult = await query(
+          `INSERT INTO users (wallet, last_claim_at, total_claimed_points)
+           VALUES ($1, $2, 0)
+           RETURNING wallet, last_claim_at, total_claimed_points`,
+          [wallet, now]
+        );
+        await query("COMMIT");
+        user = insertResult.rows[0];
+        return res.json({
+          claimed: 0,
+          total_claimed_points: 0,
+          message: "First time claim, starting timer now.",
         });
       }
-    }
 
-    if (serverEarnings <= 0) {
-      await query(
-        `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
-        [now, wallet]
+      const totalRoiPerDay = await calculateCurrentROI(wallet);
+
+      const serverEarnings = calculateUnclaimedEarnings(
+        user.last_claim_at,
+        totalRoiPerDay,
+        now
       );
+
+      if (expected_earnings !== undefined && expected_earnings !== null) {
+        const expectedNum = Number(expected_earnings);
+        const diff = Math.abs(serverEarnings - expectedNum);
+        if (diff > 0.01) {
+          await query("ROLLBACK");
+          return res.status(400).json({
+            error: "Earnings mismatch",
+            server_calculated: serverEarnings,
+            client_expected: expectedNum,
+            tolerance: 0.01,
+          });
+        }
+      }
+
+      let updateResult;
+      if (serverEarnings <= 0) {
+        updateResult = await query(
+          `UPDATE users
+           SET last_claim_at = $1
+           WHERE wallet = $2
+           RETURNING total_claimed_points`,
+          [now, wallet]
+        );
+      } else {
+        updateResult = await query(
+          `UPDATE users
+           SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
+               last_claim_at = $2
+           WHERE wallet = $3
+           RETURNING total_claimed_points`,
+          [serverEarnings, now, wallet]
+        );
+      }
+
+      await query("COMMIT");
+
+      const totalClaimed = Number(updateResult.rows[0].total_claimed_points);
+
       return res.json({
-        claimed: 0,
-        total_claimed_points: Number(user.total_claimed_points || 0),
-        message: "No earnings to claim.",
+        claimed: serverEarnings > 0 ? serverEarnings : 0,
+        total_claimed_points: totalClaimed,
       });
+    } catch (e) {
+      await query("ROLLBACK").catch(() => {});
+      throw e;
     }
-
-    const updateResult = await query(
-      `UPDATE users
-       SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
-           last_claim_at = $2
-       WHERE wallet = $3
-       RETURNING total_claimed_points`,
-      [serverEarnings, now, wallet]
-    );
-
-    const totalClaimed = Number(updateResult.rows[0].total_claimed_points);
-
-    return res.json({
-      claimed: serverEarnings,
-      total_claimed_points: totalClaimed,
-    });
   } catch (e) {
     console.error("POST /api/claim-rewards error", e);
     res.status(500).json({ error: e.message });
