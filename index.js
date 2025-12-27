@@ -152,7 +152,7 @@ app.get("/api/rewards/:wallet", async (req, res) => {
     const now = new Date();
 
     let userResult = await query(
-      `SELECT wallet, last_claim_at, total_claimed_points
+      `SELECT wallet, last_claim_at, total_claimed_points, pending_earnings
        FROM users
        WHERE wallet = $1`,
       [wallet]
@@ -162,9 +162,9 @@ app.get("/api/rewards/:wallet", async (req, res) => {
 
     if (!user) {
       const insertResult = await query(
-        `INSERT INTO users (wallet, last_claim_at, total_claimed_points)
-         VALUES ($1, $2, 0)
-         RETURNING wallet, last_claim_at, total_claimed_points`,
+        `INSERT INTO users (wallet, last_claim_at, total_claimed_points, pending_earnings)
+         VALUES ($1, $2, 0, 0)
+         RETURNING wallet, last_claim_at, total_claimed_points, pending_earnings`,
         [wallet, now]
       );
       user = insertResult.rows[0];
@@ -178,8 +178,11 @@ app.get("/api/rewards/:wallet", async (req, res) => {
       now
     );
 
+    const totalPending = Number(user.pending_earnings || 0) + Number(unclaimedEarnings);
+
     return res.json({
       unclaimed_earnings: Number(unclaimedEarnings),
+      pending_earnings: Number(user.pending_earnings || 0),
       total_claimed_points: Number(user.total_claimed_points || 0),
       last_claim_at: user.last_claim_at,
       total_roi_per_day: totalRoiPerDay,
@@ -206,7 +209,7 @@ app.post("/api/claim-rewards", async (req, res) => {
       const now = new Date();
 
       let userResult = await query(
-        `SELECT wallet, last_claim_at, total_claimed_points
+        `SELECT wallet, last_claim_at, total_claimed_points, pending_earnings
          FROM users
          WHERE wallet = $1`,
         [wallet]
@@ -216,9 +219,9 @@ app.post("/api/claim-rewards", async (req, res) => {
 
       if (!user) {
         const insertResult = await query(
-          `INSERT INTO users (wallet, last_claim_at, total_claimed_points)
-           VALUES ($1, $2, 0)
-           RETURNING wallet, last_claim_at, total_claimed_points`,
+          `INSERT INTO users (wallet, last_claim_at, total_claimed_points, pending_earnings)
+           VALUES ($1, $2, 0, 0)
+           RETURNING wallet, last_claim_at, total_claimed_points, pending_earnings`,
           [wallet, now]
         );
         await query("COMMIT");
@@ -232,20 +235,23 @@ app.post("/api/claim-rewards", async (req, res) => {
 
       const totalRoiPerDay = await calculateCurrentROI(wallet);
 
-      const serverEarnings = calculateUnclaimedEarnings(
+      const newEarnings = calculateUnclaimedEarnings(
         user.last_claim_at,
         totalRoiPerDay,
         now
       );
 
+      const pendingEarnings = Number(user.pending_earnings || 0);
+      const totalToClaim = pendingEarnings + newEarnings;
+
       if (expected_earnings !== undefined && expected_earnings !== null) {
         const expectedNum = Number(expected_earnings);
-        const diff = Math.abs(serverEarnings - expectedNum);
+        const diff = Math.abs(totalToClaim - expectedNum);
         if (diff > 0.01) {
           await query("ROLLBACK");
           return res.status(400).json({
             error: "Earnings mismatch",
-            server_calculated: serverEarnings,
+            server_calculated: totalToClaim,
             client_expected: expectedNum,
             tolerance: 0.01,
           });
@@ -253,7 +259,7 @@ app.post("/api/claim-rewards", async (req, res) => {
       }
 
       let updateResult;
-      if (serverEarnings <= 0) {
+      if (totalToClaim <= 0) {
         updateResult = await query(
           `UPDATE users
            SET last_claim_at = $1
@@ -265,10 +271,11 @@ app.post("/api/claim-rewards", async (req, res) => {
         updateResult = await query(
           `UPDATE users
            SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
+               pending_earnings = 0,
                last_claim_at = $2
            WHERE wallet = $3
            RETURNING total_claimed_points`,
-          [serverEarnings, now, wallet]
+          [totalToClaim, now, wallet]
         );
       }
 
@@ -277,7 +284,7 @@ app.post("/api/claim-rewards", async (req, res) => {
       const totalClaimed = Number(updateResult.rows[0].total_claimed_points);
 
       return res.json({
-        claimed: serverEarnings > 0 ? serverEarnings : 0,
+        claimed: totalToClaim > 0 ? totalToClaim : 0,
         total_claimed_points: totalClaimed,
       });
     } catch (e) {
@@ -410,7 +417,7 @@ app.post("/api/assign-slot", async (req, res) => {
     
     const now = new Date();
     const userResult = await query(
-      `SELECT last_claim_at, total_claimed_points
+      `SELECT last_claim_at, total_claimed_points, pending_earnings
        FROM users
        WHERE wallet = $1`,
       [wallet]
@@ -419,14 +426,14 @@ app.post("/api/assign-slot", async (req, res) => {
     let user = userResult.rows[0];
     if (!user) {
       await query(
-        `INSERT INTO users (wallet, last_claim_at, total_claimed_points)
-         VALUES ($1, $2, 0)
+        `INSERT INTO users (wallet, last_claim_at, total_claimed_points, pending_earnings)
+         VALUES ($1, $2, 0, 0)
          ON CONFLICT (wallet) DO NOTHING
-         RETURNING last_claim_at, total_claimed_points`,
+         RETURNING last_claim_at, total_claimed_points, pending_earnings`,
         [wallet, now]
       );
       const newUserResult = await query(
-        `SELECT last_claim_at, total_claimed_points
+        `SELECT last_claim_at, total_claimed_points, pending_earnings
          FROM users WHERE wallet = $1`,
         [wallet]
       );
@@ -443,7 +450,7 @@ app.post("/api/assign-slot", async (req, res) => {
     
     await query(
       `UPDATE users
-       SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
+       SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
            last_claim_at = $2
        WHERE wallet = $3`,
       [earnings, now, wallet]
@@ -476,7 +483,7 @@ app.post("/api/unassign-slot", async (req, res) => {
 
     const now = new Date();
     const userResult = await query(
-      `SELECT last_claim_at, total_claimed_points
+      `SELECT last_claim_at, total_claimed_points, pending_earnings
        FROM users
        WHERE wallet = $1`,
       [wallet]
@@ -498,7 +505,7 @@ app.post("/api/unassign-slot", async (req, res) => {
     
     await query(
       `UPDATE users
-       SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
+       SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
            last_claim_at = $2
        WHERE wallet = $3`,
       [earnings, now, wallet]
