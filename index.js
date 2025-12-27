@@ -448,13 +448,15 @@ app.post("/api/assign-slot", async (req, res) => {
       if (earnings < 0) earnings = 0;
     }
     
-    await query(
-      `UPDATE users
-       SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
-           last_claim_at = $2
-       WHERE wallet = $3`,
-      [earnings, now, wallet]
-    );
+    if (earnings > 0) {
+      await query(
+        `UPDATE users
+         SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
+             last_claim_at = $2
+         WHERE wallet = $3`,
+        [earnings, now, wallet]
+      );
+    }
 
     await query(
       `INSERT INTO ship_slots (wallet, slot_index, alien_fk)
@@ -503,13 +505,15 @@ app.post("/api/unassign-slot", async (req, res) => {
       if (earnings < 0) earnings = 0;
     }
     
-    await query(
-      `UPDATE users
-       SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
-           last_claim_at = $2
-       WHERE wallet = $3`,
-      [earnings, now, wallet]
-    );
+    if (earnings > 0) {
+      await query(
+        `UPDATE users
+         SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
+             last_claim_at = $2
+         WHERE wallet = $3`,
+        [earnings, now, wallet]
+      );
+    }
 
     const result = await query(
       `DELETE FROM ship_slots
