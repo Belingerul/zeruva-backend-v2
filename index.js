@@ -456,6 +456,11 @@ app.post("/api/assign-slot", async (req, res) => {
          WHERE wallet = $3`,
         [earnings, now, wallet]
       );
+    } else if (!user.last_claim_at) {
+      await query(
+        `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
+        [now, wallet]
+      );
     }
 
     await query(
@@ -512,6 +517,11 @@ app.post("/api/unassign-slot", async (req, res) => {
              last_claim_at = $2
          WHERE wallet = $3`,
         [earnings, now, wallet]
+      );
+    } else if (!user.last_claim_at) {
+      await query(
+        `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
+        [now, wallet]
       );
     }
 
