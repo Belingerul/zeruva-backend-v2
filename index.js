@@ -441,27 +441,23 @@ app.post("/api/assign-slot", async (req, res) => {
     }
 
     const oldROI = await calculateCurrentROI(wallet);
-    
+
     let earnings = 0;
     if (oldROI > 0 && user.last_claim_at) {
       earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
       if (earnings < 0) earnings = 0;
     }
-    
-    if (earnings > 0) {
-      await query(
-        `UPDATE users
-         SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
-             last_claim_at = $2
-         WHERE wallet = $3`,
-        [earnings, now, wallet]
-      );
-    } else if (!user.last_claim_at) {
-      await query(
-        `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
-        [now, wallet]
-      );
-    }
+
+    // CRITICAL: Always advance last_claim_at when ROI changes.
+    // Otherwise, after an assign/unassign, /api/rewards will accrue with the NEW ROI
+    // starting from an OLD last_claim_at → "ghost" earnings.
+    await query(
+      `UPDATE users
+       SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
+           last_claim_at = $2
+       WHERE wallet = $3`,
+      [earnings, now, wallet]
+    );
 
     await query(
       `INSERT INTO ship_slots (wallet, slot_index, alien_fk)
@@ -503,27 +499,23 @@ app.post("/api/unassign-slot", async (req, res) => {
     }
 
     const oldROI = await calculateCurrentROI(wallet);
-    
+
     let earnings = 0;
     if (oldROI > 0 && user.last_claim_at) {
       earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
       if (earnings < 0) earnings = 0;
     }
-    
-    if (earnings > 0) {
-      await query(
-        `UPDATE users
-         SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
-             last_claim_at = $2
-         WHERE wallet = $3`,
-        [earnings, now, wallet]
-      );
-    } else if (!user.last_claim_at) {
-      await query(
-        `UPDATE users SET last_claim_at = $1 WHERE wallet = $2`,
-        [now, wallet]
-      );
-    }
+
+    // CRITICAL: Always advance last_claim_at when ROI changes.
+    // Otherwise, after an assign/unassign, /api/rewards will accrue with the NEW ROI
+    // starting from an OLD last_claim_at → "ghost" earnings.
+    await query(
+      `UPDATE users
+       SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
+           last_claim_at = $2
+       WHERE wallet = $3`,
+      [earnings, now, wallet]
+    );
 
     const result = await query(
       `DELETE FROM ship_slots
