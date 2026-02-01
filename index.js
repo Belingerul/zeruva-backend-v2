@@ -1,36 +1,114 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const body = require("body-parser");
 const path = require("path");
 const crypto = require("crypto");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const jwt = require("jsonwebtoken");
+const nacl = require("tweetnacl");
+const bs58 = require("bs58");
 const { nanoid } = require("nanoid");
 const { PublicKey } = require("@solana/web3.js");
 const { buildTransferTx } = require("./src/sol");
 const { initDb, query } = require("./db");
 
 const app = express();
-app.use(cors({
-  origin: [
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "https://your-frontend.vercel.app",
-    "https://*.v0.app",
-    "https://*.vusercontent.net"
-  ],
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true
-}));
+app.set("trust proxy", 1);
 
-app.use(body.json({ limit: "1mb" }));
+// Basic hardening
+app.use(helmet());
+
+// Global request rate limiting (coarse)
+app.use(
+  rateLimit({
+    windowMs: 60_000,
+    max: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+
+// CORS: use explicit allow-list (no wildcard strings).
+// Set FRONTEND_ORIGINS as comma-separated list (e.g. "https://app.example.com,https://staging.example.com")
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // server-to-server or curl
+  // Always allow localhost during dev
+  if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return true;
+  if (FRONTEND_ORIGINS.includes(origin)) return true;
+  return false;
+}
+
+app.use(
+  cors({
+    origin: function (origin, cb) {
+      if (isAllowedOrigin(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: "1mb" }));
 app.use("/static", express.static(path.join(__dirname, "public")));
 
 const ADMIN_WALLET = process.env.ADMIN_WALLET;
 const RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/,'') || 'http://localhost:3000';
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || "http://localhost:3000";
 const ALIEN_COUNT = parseInt(process.env.ALIEN_COUNT || "60", 10);
+
+// ===== Auth (Solana signature -> JWT) =====
+let JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  if ((process.env.NODE_ENV || "development") !== "production") {
+    JWT_SECRET = crypto.randomBytes(32).toString("hex");
+    console.warn(
+      "⚠️  JWT_SECRET is not set. Generated a temporary dev JWT secret (tokens will reset on restart)."
+    );
+  } else {
+    console.warn("⚠️  JWT_SECRET is not set. Auth will fail. Set JWT_SECRET in your environment.");
+  }
+}
+
+// short-lived nonce store (in-memory). For multi-instance, move to Redis.
+const nonces = new Map();
+const NONCE_TTL_MS = 5 * 60 * 1000;
+
+function createNonce(wallet) {
+  const nonce = nanoid(32);
+  nonces.set(wallet, { nonce, exp: Date.now() + NONCE_TTL_MS });
+  return nonce;
+}
+
+function getNonce(wallet) {
+  const entry = nonces.get(wallet);
+  if (!entry) return null;
+  if (Date.now() > entry.exp) {
+    nonces.delete(wallet);
+    return null;
+  }
+  return entry.nonce;
+}
+
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing Bearer token" });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.auth = payload;
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: "Invalid/expired token" });
+  }
+}
 
 // ======= Helper to build absolute image URLs =======
 const imgUrl = (id) => `${PUBLIC_BASE_URL}/static/${id}.png`;
@@ -139,7 +217,7 @@ async function calculateCurrentROI(wallet) {
   return totalRoiPerDay;
 }
 
-app.get("/api/rewards/:wallet", async (req, res) => {
+app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
   try {
     const { wallet } = req.params;
     if (!wallet) {
@@ -147,6 +225,9 @@ app.get("/api/rewards/:wallet", async (req, res) => {
     }
     if (!isProbableSolanaAddress(wallet)) {
       return res.status(400).json({ error: "Invalid wallet address" });
+    }
+    if (req.auth?.wallet !== wallet) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
     const now = new Date();
@@ -193,11 +274,12 @@ app.get("/api/rewards/:wallet", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-app.post("/api/claim-rewards", async (req, res) => {
+app.post("/api/claim-rewards", requireAuth, async (req, res) => {
   try {
-    const { wallet, expected_earnings } = req.body || {};
+    const { expected_earnings } = req.body || {};
+    const wallet = req.auth?.wallet;
     if (!wallet) {
-      return res.status(400).json({ error: "Missing wallet" });
+      return res.status(401).json({ error: "Unauthorized" });
     }
     if (!isProbableSolanaAddress(wallet)) {
       return res.status(400).json({ error: "Invalid wallet address" });
@@ -299,7 +381,58 @@ app.post("/api/claim-rewards", async (req, res) => {
 
 
 app.get("/api/health", (_, res) => {
-  res.json({ ok: true, admin: ADMIN_WALLET, aliens: ALIEN_COUNT });
+  res.json({ ok: true, aliens: ALIEN_COUNT });
+});
+
+// Get a nonce to sign for login
+app.post("/api/auth/nonce", (req, res) => {
+  const { wallet } = req.body || {};
+  if (!wallet || !isProbableSolanaAddress(wallet)) {
+    return res.status(400).json({ error: "Invalid wallet" });
+  }
+  const nonce = createNonce(wallet);
+  const message = `Zeruva login\nWallet: ${wallet}\nNonce: ${nonce}`;
+  res.json({ wallet, nonce, message, ttl_ms: NONCE_TTL_MS });
+});
+
+// Verify signature and issue JWT
+app.post("/api/auth/verify", (req, res) => {
+  if (!JWT_SECRET) return res.status(500).json({ error: "Server misconfigured (JWT_SECRET missing)" });
+
+  const { wallet, signature, nonce } = req.body || {};
+  if (!wallet || !signature || !nonce) {
+    return res.status(400).json({ error: "Missing fields" });
+  }
+  if (!isProbableSolanaAddress(wallet)) {
+    return res.status(400).json({ error: "Invalid wallet" });
+  }
+
+  const expected = getNonce(wallet);
+  if (!expected || expected !== nonce) {
+    return res.status(400).json({ error: "Invalid/expired nonce" });
+  }
+
+  const message = `Zeruva login\nWallet: ${wallet}\nNonce: ${nonce}`;
+
+  try {
+    const pubkey = new PublicKey(wallet);
+    const sigBytes = bs58.decode(signature);
+    const ok = nacl.sign.detached.verify(
+      Buffer.from(message),
+      sigBytes,
+      pubkey.toBytes()
+    );
+
+    if (!ok) return res.status(401).json({ error: "Signature verification failed" });
+
+    // Consume nonce (one-time)
+    nonces.delete(wallet);
+
+    const token = jwt.sign({ wallet }, JWT_SECRET, { expiresIn: "12h" });
+    return res.json({ token, wallet, expires_in: "12h" });
+  } catch (e) {
+    return res.status(400).json({ error: "Bad signature format" });
+  }
 });
 
 app.get("/api/db-health", async (req, res) => {
@@ -406,8 +539,9 @@ app.post("/api/upgrade-ship", async (req, res) => {
   }
 });
 
-app.post("/api/assign-slot", async (req, res) => {
-  const { wallet, slotIndex, alienDbId } = req.body;
+app.post("/api/assign-slot", requireAuth, async (req, res) => {
+  const { slotIndex, alienDbId } = req.body || {};
+  const wallet = req.auth?.wallet;
 
   if (!wallet || slotIndex == null || !alienDbId)
     return res.status(400).json({ error: "Missing fields" });
@@ -475,8 +609,9 @@ app.post("/api/assign-slot", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-app.post("/api/unassign-slot", async (req, res) => {
-  const { wallet, alienDbId } = req.body;
+app.post("/api/unassign-slot", requireAuth, async (req, res) => {
+  const { alienDbId } = req.body || {};
+  const wallet = req.auth?.wallet;
 
   if (!wallet || !alienDbId)
     return res.status(400).json({ error: "Missing fields" });
@@ -538,9 +673,9 @@ app.post("/api/unassign-slot", async (req, res) => {
   }
 });
 
-app.post("/api/register", async (req, res) => {
-  const { wallet } = req.body;
-  if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+app.post("/api/register", requireAuth, async (req, res) => {
+  const wallet = req.auth?.wallet;
+  if (!wallet) return res.status(401).json({ error: "Unauthorized" });
 
   try {
     await query(
@@ -557,10 +692,11 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
-app.post("/api/spin", limitSpin, async (req, res) => {
-  const { wallet, eggType = "basic" } = req.body || {};
+app.post("/api/spin", requireAuth, limitSpin, async (req, res) => {
+  const { eggType = "basic" } = req.body || {};
+  const wallet = req.auth?.wallet;
 
-  if (!wallet) return res.status(400).json({ error: "Missing wallet" });
+  if (!wallet) return res.status(401).json({ error: "Unauthorized" });
 
   // Apply egg modifiers
   const mod = EGG_MOD[eggType] || EGG_MOD.basic;
@@ -630,9 +766,10 @@ app.post("/api/spin", limitSpin, async (req, res) => {
 
 
 
-app.post("/api/buy-spaceship", async (req, res) => {
+app.post("/api/buy-spaceship", requireAuth, async (req, res) => {
   try {
-    const { wallet, level } = req.body || {};
+    const { level } = req.body || {};
+    const wallet = req.auth?.wallet;
     if (!wallet || !level) return res.status(400).json({ error: "missing fields" });
 
     const priceUSD = level === 1 ? 30 : level === 2 ? 60 : level === 3 ? 120 : null;
