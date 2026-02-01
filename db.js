@@ -4,8 +4,9 @@ const { Pool } = require("pg")
 // In dev, if DATABASE_URL is not set, we fall back to an in-memory Postgres (pg-mem)
 // so the app can run locally without installing PostgreSQL.
 let pool;
+const USING_PGMEM = !process.env.DATABASE_URL && (process.env.NODE_ENV || "development") !== "production";
 
-if (!process.env.DATABASE_URL && (process.env.NODE_ENV || "development") !== "production") {
+if (USING_PGMEM) {
   const { newDb } = require("pg-mem");
   const mem = newDb({ autoCreateForeignKeyIndices: true });
   const pg = mem.adapters.createPg();
@@ -43,75 +44,90 @@ async function query(text, params) {
 // This will be used to create tables on startup
 async function initDb() {
   // 1) users table
-await query(`
-  CREATE TABLE IF NOT EXISTS users (
-    wallet TEXT PRIMARY KEY,
-    ship_level INTEGER DEFAULT 1,
-    expedition_active BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT NOW()
-  );
-`);
+  if (USING_PGMEM) {
+    // pg-mem doesn't support DO $$ plpgsql blocks; create full schema directly for dev.
+    await query(`
+      CREATE TABLE IF NOT EXISTS users (
+        wallet TEXT PRIMARY KEY,
+        ship_level INTEGER DEFAULT 1,
+        expedition_active BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        last_claim_at TIMESTAMP DEFAULT NOW(),
+        total_claimed_points NUMERIC(30, 10) DEFAULT 0,
+        pending_earnings NUMERIC(30, 10) DEFAULT 0
+      );
+    `);
+  } else {
+    await query(`
+      CREATE TABLE IF NOT EXISTS users (
+        wallet TEXT PRIMARY KEY,
+        ship_level INTEGER DEFAULT 1,
+        expedition_active BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
 
-// 1a) ensure last_claim_at column exists
-await query(`
-  DO $$
-  BEGIN
-    IF NOT EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'users' AND column_name = 'last_claim_at'
-    ) THEN
-      ALTER TABLE users
-      ADD COLUMN last_claim_at TIMESTAMP DEFAULT NOW();
-    END IF;
-  END$$;
-`);
+    // 1a) ensure last_claim_at column exists
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'last_claim_at'
+        ) THEN
+          ALTER TABLE users
+          ADD COLUMN last_claim_at TIMESTAMP DEFAULT NOW();
+        END IF;
+      END$$;
+    `);
 
-// 1b) ensure total_claimed_points column exists (NUMERIC for high precision)
-await query(`
-  DO $$
-  BEGIN
-    IF NOT EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'users' AND column_name = 'total_claimed_points'
-    ) THEN
-      ALTER TABLE users
-      ADD COLUMN total_claimed_points NUMERIC(30, 10) DEFAULT 0;
-    END IF;
-  END$$;
-`);
+    // 1b) ensure total_claimed_points column exists (NUMERIC for high precision)
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'total_claimed_points'
+        ) THEN
+          ALTER TABLE users
+          ADD COLUMN total_claimed_points NUMERIC(30, 10) DEFAULT 0;
+        END IF;
+      END$$;
+    `);
 
-// 1c) ensure pending_earnings column exists (NUMERIC for high precision)
-await query(`
-  DO $$
-  BEGIN
-    IF NOT EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'users' AND column_name = 'pending_earnings'
-    ) THEN
-      ALTER TABLE users
-      ADD COLUMN pending_earnings NUMERIC(30, 10) DEFAULT 0;
-    END IF;
-  END$$;
-`);
+    // 1c) ensure pending_earnings column exists (NUMERIC for high precision)
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'pending_earnings'
+        ) THEN
+          ALTER TABLE users
+          ADD COLUMN pending_earnings NUMERIC(30, 10) DEFAULT 0;
+        END IF;
+      END$$;
+    `);
 
-// 1d) migrate pending_points to pending_earnings if pending_points exists
-await query(`
-  DO $$
-  BEGIN
-    IF EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'users' AND column_name = 'pending_points'
-    ) AND EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name = 'users' AND column_name = 'pending_earnings'
-    ) THEN
-      UPDATE users
-      SET pending_earnings = COALESCE(pending_earnings, 0) + COALESCE(pending_points, 0)
-      WHERE pending_points IS NOT NULL AND pending_points > 0;
-      ALTER TABLE users DROP COLUMN IF EXISTS pending_points;
-    END IF;
-  END$$;
-`);
+    // 1d) migrate pending_points to pending_earnings if pending_points exists
+    await query(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'pending_points'
+        ) AND EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'pending_earnings'
+        ) THEN
+          UPDATE users
+          SET pending_earnings = COALESCE(pending_earnings, 0) + COALESCE(pending_points, 0)
+          WHERE pending_points IS NOT NULL AND pending_points > 0;
+          ALTER TABLE users DROP COLUMN IF EXISTS pending_points;
+        END IF;
+      END$$;
+    `);
+  }
   // 2) aliens owned by users
   await query(`
     CREATE TABLE IF NOT EXISTS aliens (
@@ -136,36 +152,57 @@ await query(`
   `);
 
   // 3a) ensure UNIQUE(wallet, slot_index) for ON CONFLICT (wallet, slot_index)
-  await query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'ship_slots_wallet_slot_unique'
-      ) THEN
+  if (USING_PGMEM) {
+    // pg-mem doesn't support DO $$ blocks. Best-effort add constraints.
+    try {
+      await query(`
         ALTER TABLE ship_slots
         ADD CONSTRAINT ship_slots_wallet_slot_unique
         UNIQUE (wallet, slot_index);
-      END IF;
-    END$$;
-  `);
+      `);
+    } catch (_) {}
+  } else {
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conname = 'ship_slots_wallet_slot_unique'
+        ) THEN
+          ALTER TABLE ship_slots
+          ADD CONSTRAINT ship_slots_wallet_slot_unique
+          UNIQUE (wallet, slot_index);
+        END IF;
+      END$$;
+    `);
+  }
 
   // 3b) optional but recommended: each alien only once per wallet
-  await query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'ship_slots_wallet_alien_unique'
-      ) THEN
+  if (USING_PGMEM) {
+    try {
+      await query(`
         ALTER TABLE ship_slots
         ADD CONSTRAINT ship_slots_wallet_alien_unique
         UNIQUE (wallet, alien_fk);
-      END IF;
-    END$$;
-  `);
+      `);
+    } catch (_) {}
+  } else {
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conname = 'ship_slots_wallet_alien_unique'
+        ) THEN
+          ALTER TABLE ship_slots
+          ADD CONSTRAINT ship_slots_wallet_alien_unique
+          UNIQUE (wallet, alien_fk);
+        END IF;
+      END$$;
+    `);
+  }
 
   console.log("✅ Database tables ensured/created");
 }
@@ -173,4 +210,5 @@ await query(`
 module.exports = {
   query,
   initDb,
+  USING_PGMEM,
 }
