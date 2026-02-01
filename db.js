@@ -1,9 +1,27 @@
 const { Pool } = require("pg")
 
 // Uses the DATABASE_URL you referenced in Railway
+// SECURITY NOTE:
+// - `rejectUnauthorized: false` disables TLS cert validation (MITM risk).
+// - Some platforms (e.g. Railway) may require relaxed validation; make it configurable.
+const ssl = (() => {
+  if (process.env.PGSSLMODE === "disable") return false;
+
+  // Default to secure verification.
+  const rejectUnauthorized = process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false";
+
+  // Optional custom CA (PEM string)
+  const ca = process.env.DB_SSL_CA;
+
+  return {
+    rejectUnauthorized,
+    ...(ca ? { ca } : {}),
+  };
+})();
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Railway needs SSL but with relaxed verify
+  ssl,
 })
 
 async function query(text, params) {
