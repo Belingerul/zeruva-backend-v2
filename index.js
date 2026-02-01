@@ -471,7 +471,15 @@ app.get("/api/aliens/:wallet", async (req, res) => {
       `SELECT * FROM aliens WHERE wallet = $1 ORDER BY id DESC`,
       [wallet]
     );
-    res.json(result.rows);
+
+    // IMPORTANT: Older DB rows may contain stale/incorrect absolute URLs.
+    // Always re-derive image URLs from the request.
+    const normalized = result.rows.map((row) => ({
+      ...row,
+      image: row.alien_id ? imgUrl(req, row.alien_id) : row.image,
+    }));
+
+    res.json(normalized);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -507,7 +515,7 @@ app.get("/api/ship/:wallet", async (req, res) => {
           alien: {
             id:       found.id,
             alien_id: found.alien_id,
-            image:    found.image,
+            image:    found.alien_id ? imgUrl(req, found.alien_id) : found.image,
             tier:     found.tier,
             roi:      Number(found.roi),
           },
