@@ -1,28 +1,40 @@
 const { Pool } = require("pg")
 
 // Uses the DATABASE_URL you referenced in Railway
-// SECURITY NOTE:
-// - `rejectUnauthorized: false` disables TLS cert validation (MITM risk).
-// - Some platforms (e.g. Railway) may require relaxed validation; make it configurable.
-const ssl = (() => {
-  if (process.env.PGSSLMODE === "disable") return false;
+// In dev, if DATABASE_URL is not set, we fall back to an in-memory Postgres (pg-mem)
+// so the app can run locally without installing PostgreSQL.
+let pool;
 
-  // Default to secure verification.
-  const rejectUnauthorized = process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false";
+if (!process.env.DATABASE_URL && (process.env.NODE_ENV || "development") !== "production") {
+  const { newDb } = require("pg-mem");
+  const mem = newDb({ autoCreateForeignKeyIndices: true });
+  const pg = mem.adapters.createPg();
+  pool = new pg.Pool();
+  console.warn("⚠️  DATABASE_URL not set. Using in-memory Postgres (pg-mem) for local dev.");
+} else {
+  // SECURITY NOTE:
+  // - `rejectUnauthorized: false` disables TLS cert validation (MITM risk).
+  // - Some platforms (e.g. Railway) may require relaxed validation; make it configurable.
+  const ssl = (() => {
+    if (process.env.PGSSLMODE === "disable") return false;
 
-  // Optional custom CA (PEM string)
-  const ca = process.env.DB_SSL_CA;
+    // Default to secure verification.
+    const rejectUnauthorized = process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false";
 
-  return {
-    rejectUnauthorized,
-    ...(ca ? { ca } : {}),
-  };
-})();
+    // Optional custom CA (PEM string)
+    const ca = process.env.DB_SSL_CA;
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl,
-})
+    return {
+      rejectUnauthorized,
+      ...(ca ? { ca } : {}),
+    };
+  })();
+
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl,
+  });
+}
 
 async function query(text, params) {
   return pool.query(text, params)
