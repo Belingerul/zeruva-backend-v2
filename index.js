@@ -61,7 +61,7 @@ app.use("/static", express.static(path.join(__dirname, "public")));
 
 const ADMIN_WALLET = process.env.ADMIN_WALLET;
 const RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || "http://localhost:3000";
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || "";
 const ALIEN_COUNT = parseInt(process.env.ALIEN_COUNT || "60", 10);
 
 // ===== Auth (Solana signature -> JWT) =====
@@ -111,13 +111,17 @@ function requireAuth(req, res, next) {
 }
 
 // ======= Helper to build absolute image URLs =======
-const imgUrl = (id) => `${PUBLIC_BASE_URL}/static/${id}.png`;
-const ALIENS = Array.from({ length: ALIEN_COUNT }, (_, i) => ({
-  id: i + 1,
-  image: imgUrl(i + 1)
-}));
+// NOTE: If PUBLIC_BASE_URL is misconfigured (e.g. includes "/api" or points at localhost),
+// images will break. To be resilient, derive base URL from the request when possible.
+function requestBaseUrl(req) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+  const host = req.get("host");
+  const proto = req.protocol || "https";
+  return `${proto}://${host}`;
+}
 
-const NOTHING_IMAGE = `${PUBLIC_BASE_URL}/static/nothing.png`;
+const imgUrl = (req, id) => `${requestBaseUrl(req)}/static/${id}.png`;
+const nothingUrl = (req) => `${requestBaseUrl(req)}/static/nothing.png`;
 
 // ======= Game configuration (dollar-per-day model) =======
 
@@ -447,7 +451,13 @@ app.get("/api/db-health", async (req, res) => {
 
 app.get("/api/get-random-aliens", (req, res) => {
   const count = Math.min(parseInt(req.query.count || "16", 10), ALIEN_COUNT);
-  const pool = [...ALIENS];
+
+  // Build list with request-derived base URL to avoid broken PUBLIC_BASE_URL.
+  const pool = Array.from({ length: ALIEN_COUNT }, (_, i) => ({
+    id: i + 1,
+    image: imgUrl(req, i + 1),
+  }));
+
   for (let i = pool.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [pool[i], pool[j]] = [pool[j], pool[i]];
@@ -723,7 +733,7 @@ app.post("/api/spin", requireAuth, limitSpin, async (req, res) => {
 
   // Special case: Nothing → show image, but DO NOT save to DB
   if (tier === "Nothing") {
-    const alien = { id: null, image: NOTHING_IMAGE };
+    const alien = { id: null, image: nothingUrl(req) };
 
     const payload = { ...basePayload, alien };
 
@@ -741,7 +751,7 @@ app.post("/api/spin", requireAuth, limitSpin, async (req, res) => {
 
   // Normal case: real alien stored in DB and appears in hangar
   const randId = 1 + Math.floor(Math.random() * ALIEN_COUNT);
-  const alien = { id: randId, image: imgUrl(randId) };
+  const alien = { id: randId, image: imgUrl(req, randId) };
 
   const payload = { ...basePayload, alien };
 
