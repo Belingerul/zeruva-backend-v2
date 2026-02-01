@@ -48,7 +48,10 @@ app.use(
   cors({
     origin: function (origin, cb) {
       if (isAllowedOrigin(origin)) return cb(null, true);
-      return cb(new Error("CORS blocked"));
+      // Do not hard-fail the request (this can break /static image loads).
+      // Instead, deny CORS by omitting headers; browser fetches will be blocked by CORS,
+      // but simple asset loads can still work.
+      return cb(null, false);
     },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
