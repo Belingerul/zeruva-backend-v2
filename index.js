@@ -17,7 +17,16 @@ const app = express();
 app.set("trust proxy", 1);
 
 // Basic hardening
-app.use(helmet());
+// NOTE: This service hosts cross-origin static assets (/static/*.png) used by the frontend.
+// Helmet defaults (CORP same-origin + strict CSP) can block those images in the browser.
+app.use(
+  helmet({
+    // Allow other origins (frontend) to load images from /static
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    // CSP is more appropriate on the frontend; disable here to avoid breaking assets.
+    contentSecurityPolicy: false,
+  })
+);
 
 // Global request rate limiting (coarse)
 app.use(
