@@ -342,16 +342,21 @@ app.post("/api/claim-rewards", requireAuth, async (req, res) => {
       const pendingEarnings = Number(user.pending_earnings || 0);
       const totalToClaim = pendingEarnings + newEarnings;
 
+      // Anti-cheat validation: client supplies expected_earnings and we compare.
+      // NOTE: Real networks have latency and client/server clocks differ. Keep a sane tolerance.
+      const CLAIM_TOLERANCE = Number(process.env.CLAIM_TOLERANCE || "0.05");
+
       if (expected_earnings !== undefined && expected_earnings !== null) {
         const expectedNum = Number(expected_earnings);
         const diff = Math.abs(totalToClaim - expectedNum);
-        if (diff > 0.01) {
+        if (diff > CLAIM_TOLERANCE) {
           await query("ROLLBACK");
           return res.status(400).json({
             error: "Earnings mismatch",
-            server_calculated: totalToClaim,
-            client_expected: expectedNum,
-            tolerance: 0.01,
+            server_calculated: Number(totalToClaim.toFixed(6)),
+            client_expected: Number(expectedNum.toFixed(6)),
+            diff: Number(diff.toFixed(6)),
+            tolerance: CLAIM_TOLERANCE,
           });
         }
       }
