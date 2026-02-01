@@ -65,9 +65,16 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || "htt
 const ALIEN_COUNT = parseInt(process.env.ALIEN_COUNT || "60", 10);
 
 // ===== Auth (Solana signature -> JWT) =====
-const JWT_SECRET = process.env.JWT_SECRET;
+let JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
-  console.warn("⚠️  JWT_SECRET is not set. Auth will fail. Set JWT_SECRET in your environment.");
+  if ((process.env.NODE_ENV || "development") !== "production") {
+    JWT_SECRET = crypto.randomBytes(32).toString("hex");
+    console.warn(
+      "⚠️  JWT_SECRET is not set. Generated a temporary dev JWT secret (tokens will reset on restart)."
+    );
+  } else {
+    console.warn("⚠️  JWT_SECRET is not set. Auth will fail. Set JWT_SECRET in your environment.");
+  }
 }
 
 // short-lived nonce store (in-memory). For multi-instance, move to Redis.
