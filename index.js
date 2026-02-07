@@ -10,7 +10,7 @@ const nacl = require("tweetnacl");
 const bs58 = require("bs58").default;
 const { nanoid } = require("nanoid");
 const { PublicKey } = require("@solana/web3.js");
-const { buildTransferTx } = require("./src/sol");
+const { buildTransferTx, verifySolPayment } = require("./src/sol");
 const { initDb, query } = require("./db");
 
 const app = express();
@@ -195,6 +195,31 @@ const LEVEL_SLOTS = {
   2: 4,
   3: 6,
 };
+
+// ======= Payments (Option A) =======
+const USD_PER_SOL = Number(process.env.USD_PER_SOL || 100);
+const EGG_PRICE_USD = {
+  basic: 20,
+  rare: 40,
+  ultra: 60,
+};
+const SHIP_PRICE_USD = {
+  1: 30,
+  2: 60,
+  3: 120,
+};
+
+function usdToSol(usd) {
+  return usd / USD_PER_SOL;
+}
+
+function eggColumn(eggType) {
+  if (eggType === "basic") return "eggs_basic";
+  if (eggType === "rare") return "eggs_rare";
+  if (eggType === "ultra") return "eggs_ultra";
+  return null;
+}
+
 // ======= Validate Solana address (basic check) =======
 function isProbableSolanaAddress(address) {
   return (
@@ -733,6 +758,28 @@ app.post("/api/spin", requireAuth, limitSpin, async (req, res) => {
 
   if (!wallet) return res.status(401).json({ error: "Unauthorized" });
 
+  // Require an egg credit for the selected eggType
+  const col = eggColumn(eggType);
+  if (!col) return res.status(400).json({ error: "Invalid eggType" });
+
+  const credits = await query(`SELECT ${col} FROM users WHERE wallet = $1`, [
+    wallet,
+  ]);
+  const count = Number(credits.rows[0]?.[col] ?? 0);
+  if (count <= 0) {
+    return res.status(402).json({
+      error: "No egg credits",
+      eggType,
+      message: "Buy an egg first.",
+    });
+  }
+
+  // Decrement credit immediately (best-effort). If we crash mid-spin, user lost 1 credit;
+  // in production we'd wrap purchase/spin in a stronger transaction model.
+  await query(`UPDATE users SET ${col} = GREATEST(${col} - 1, 0) WHERE wallet = $1`, [
+    wallet,
+  ]);
+
   // Apply egg modifiers
   const mod = EGG_MOD[eggType] || EGG_MOD.basic;
 
@@ -801,31 +848,213 @@ app.post("/api/spin", requireAuth, limitSpin, async (req, res) => {
 
 
 
-app.post("/api/buy-spaceship", requireAuth, async (req, res) => {
+// --- Payments API (devnet) ---
+// Prepare a SOL transfer tx for an egg purchase
+app.post("/api/buy-egg", requireAuth, async (req, res) => {
   try {
-    const { level } = req.body || {};
+    const { eggType = "basic" } = req.body || {};
     const wallet = req.auth?.wallet;
-    if (!wallet || !level) return res.status(400).json({ error: "missing fields" });
+    if (!wallet) return res.status(400).json({ error: "missing wallet" });
 
-    const priceUSD = level === 1 ? 30 : level === 2 ? 60 : level === 3 ? 120 : null;
-    if (!priceUSD) return res.status(400).json({ error: "invalid level" });
+    const priceUsd = EGG_PRICE_USD[eggType];
+    if (!priceUsd) return res.status(400).json({ error: "invalid eggType" });
 
-    const usdPerSol = 100;
-    const amountSol = priceUSD / usdPerSol;
+    const amountSol = usdToSol(priceUsd);
 
     const admin = new PublicKey(ADMIN_WALLET);
     const tx = await buildTransferTx({
       rpcUrl: RPC_URL,
       fromPubkey: wallet,
       toPubkey: admin,
-      amountSol
+      amountSol,
     });
 
     const serialized = Buffer.from(
-      tx.serialize({ requireAllSignatures: false, verifySignatures: false })
+      tx.serialize({ requireAllSignatures: false, verifySignatures: false }),
+    ).toString("base64");
+
+    res.json({ serialized, amountSol, admin: admin.toBase58(), eggType });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Confirm a signed payment and credit the egg
+app.post("/api/confirm-buy-egg", requireAuth, async (req, res) => {
+  try {
+    const { eggType = "basic", signature } = req.body || {};
+    const wallet = req.auth?.wallet;
+    if (!wallet || !signature)
+      return res.status(400).json({ error: "missing fields" });
+
+    const priceUsd = EGG_PRICE_USD[eggType];
+    if (!priceUsd) return res.status(400).json({ error: "invalid eggType" });
+
+    const amountSol = usdToSol(priceUsd);
+    const minLamports = Math.round(amountSol * 1e9);
+
+    // Prevent replay
+    const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [
+      signature,
+    ]);
+    if (already.rowCount > 0) {
+      return res.status(409).json({ error: "payment already processed" });
+    }
+
+    const verify = await verifySolPayment({
+      rpcUrl: RPC_URL,
+      signature,
+      expectedFrom: wallet,
+      expectedTo: ADMIN_WALLET,
+      minLamports,
+    });
+
+    if (!verify.ok) {
+      return res.status(400).json({ error: "invalid payment", detail: verify });
+    }
+
+    // Ensure user exists
+    await query(
+      `INSERT INTO users (wallet)
+       VALUES ($1)
+       ON CONFLICT (wallet) DO NOTHING`,
+      [wallet],
+    );
+
+    const col = eggColumn(eggType);
+    if (!col) return res.status(400).json({ error: "invalid eggType" });
+
+    await query("BEGIN");
+    try {
+      await query(
+        `INSERT INTO payments (signature, wallet, kind, amount_sol, metadata)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          signature,
+          wallet,
+          `buy_egg:${eggType}`,
+          amountSol,
+          JSON.stringify({ eggType }),
+        ],
+      );
+
+      await query(
+        `UPDATE users SET ${col} = COALESCE(${col}, 0) + 1 WHERE wallet = $1`,
+        [wallet],
+      );
+
+      await query("COMMIT");
+    } catch (e) {
+      await query("ROLLBACK");
+      throw e;
+    }
+
+    res.json({ ok: true, eggType, credited: 1, signature });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Prepare a SOL transfer tx for a ship purchase
+app.post("/api/buy-spaceship", requireAuth, async (req, res) => {
+  try {
+    const { level } = req.body || {};
+    const wallet = req.auth?.wallet;
+    if (!wallet || !level)
+      return res.status(400).json({ error: "missing fields" });
+
+    const priceUsd = SHIP_PRICE_USD[String(level)];
+    if (!priceUsd) return res.status(400).json({ error: "invalid level" });
+
+    const amountSol = usdToSol(priceUsd);
+
+    const admin = new PublicKey(ADMIN_WALLET);
+    const tx = await buildTransferTx({
+      rpcUrl: RPC_URL,
+      fromPubkey: wallet,
+      toPubkey: admin,
+      amountSol,
+    });
+
+    const serialized = Buffer.from(
+      tx.serialize({ requireAllSignatures: false, verifySignatures: false }),
     ).toString("base64");
 
     res.json({ serialized, amountSol, admin: admin.toBase58(), level });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Confirm ship payment and set ship_level
+app.post("/api/confirm-buy-spaceship", requireAuth, async (req, res) => {
+  try {
+    const { level, signature } = req.body || {};
+    const wallet = req.auth?.wallet;
+    if (!wallet || !level || !signature)
+      return res.status(400).json({ error: "missing fields" });
+
+    const priceUsd = SHIP_PRICE_USD[String(level)];
+    if (!priceUsd) return res.status(400).json({ error: "invalid level" });
+
+    const amountSol = usdToSol(priceUsd);
+    const minLamports = Math.round(amountSol * 1e9);
+
+    const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [
+      signature,
+    ]);
+    if (already.rowCount > 0) {
+      return res.status(409).json({ error: "payment already processed" });
+    }
+
+    const verify = await verifySolPayment({
+      rpcUrl: RPC_URL,
+      signature,
+      expectedFrom: wallet,
+      expectedTo: ADMIN_WALLET,
+      minLamports,
+    });
+
+    if (!verify.ok) {
+      return res.status(400).json({ error: "invalid payment", detail: verify });
+    }
+
+    await query(
+      `INSERT INTO users (wallet)
+       VALUES ($1)
+       ON CONFLICT (wallet) DO NOTHING`,
+      [wallet],
+    );
+
+    await query("BEGIN");
+    try {
+      await query(
+        `INSERT INTO payments (signature, wallet, kind, amount_sol, metadata)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          signature,
+          wallet,
+          `buy_ship:${level}`,
+          amountSol,
+          JSON.stringify({ level: Number(level) }),
+        ],
+      );
+
+      await query(
+        `UPDATE users SET ship_level = GREATEST(COALESCE(ship_level, 1), $1) WHERE wallet = $2`,
+        [Number(level), wallet],
+      );
+
+      await query("COMMIT");
+    } catch (e) {
+      await query("ROLLBACK");
+      throw e;
+    }
+
+    res.json({ ok: true, level: Number(level), signature });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });

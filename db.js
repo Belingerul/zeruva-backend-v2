@@ -204,6 +204,45 @@ async function initDb() {
     `);
   }
 
+  // 4) payments / purchases (prevent replay + track credits)
+  await query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      signature TEXT PRIMARY KEY,
+      wallet TEXT REFERENCES users(wallet),
+      kind TEXT NOT NULL,
+      amount_sol DOUBLE PRECISION NOT NULL,
+      metadata JSONB,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // 1e) egg credits (Option A: on-chain payment, off-chain inventory)
+  await query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'users' AND column_name = 'eggs_basic'
+      ) THEN
+        ALTER TABLE users ADD COLUMN eggs_basic INTEGER DEFAULT 0;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'users' AND column_name = 'eggs_rare'
+      ) THEN
+        ALTER TABLE users ADD COLUMN eggs_rare INTEGER DEFAULT 0;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'users' AND column_name = 'eggs_ultra'
+      ) THEN
+        ALTER TABLE users ADD COLUMN eggs_ultra INTEGER DEFAULT 0;
+      END IF;
+    END$$;
+  `);
+
   console.log("✅ Database tables ensured/created");
 }
 
