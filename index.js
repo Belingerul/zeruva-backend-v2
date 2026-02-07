@@ -105,9 +105,9 @@ const LEVEL_SLOTS = {
 // ======= Payments (Option A) =======
 const USD_PER_SOL = Number(process.env.USD_PER_SOL || 100);
 const EGG_PRICE_USD = {
-  basic: 5,
-  rare: 10,
-  ultra: 20,
+  basic: 20,
+  rare: 40,
+  ultra: 60,
 };
 const SHIP_PRICE_USD = {
   1: 30,
