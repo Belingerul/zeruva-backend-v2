@@ -11,6 +11,7 @@ const bs58 = require("bs58").default;
 const { nanoid } = require("nanoid");
 const { PublicKey } = require("@solana/web3.js");
 const { buildTransferTx, verifySolPayment } = require("./src/sol");
+const { getSolUsdPrice, usdToLamports } = require("./src/pricing");
 const { initDb, query } = require("./db");
 
 const app = express();
@@ -197,7 +198,8 @@ const LEVEL_SLOTS = {
 };
 
 // ======= Payments (Option A) =======
-const USD_PER_SOL = Number(process.env.USD_PER_SOL || 100);
+// Prices are denominated in USD; we quote SOL at purchase time via a public SOL/USD feed.
+// USD_PER_SOL remains as a fallback constant for when the price feed is down.
 const EGG_PRICE_USD = {
   basic: 20,
   rare: 40,
@@ -209,8 +211,8 @@ const SHIP_PRICE_USD = {
   3: 120,
 };
 
-function usdToSol(usd) {
-  return usd / USD_PER_SOL;
+function lamportsToSol(lamports) {
+  return Number(lamports) / 1e9;
 }
 
 function eggColumn(eggType) {
@@ -859,21 +861,43 @@ app.post("/api/buy-egg", requireAuth, async (req, res) => {
     const priceUsd = EGG_PRICE_USD[eggType];
     if (!priceUsd) return res.status(400).json({ error: "invalid eggType" });
 
-    const amountSol = usdToSol(priceUsd);
+    const { solUsd, source } = await getSolUsdPrice();
+    const lamports = usdToLamports({ usd: priceUsd, solUsd });
+    const amountSol = lamportsToSol(lamports);
+
+    // Save a short-lived intent so confirmation uses the exact quoted amount.
+    const intentId = nanoid(24);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    await query(
+      `INSERT INTO payment_intents (id, wallet, kind, price_usd, sol_usd, lamports, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [intentId, wallet, `buy_egg:${eggType}`, priceUsd, solUsd, String(lamports), expiresAt]
+    );
 
     const admin = new PublicKey(ADMIN_WALLET);
     const tx = await buildTransferTx({
       rpcUrl: RPC_URL,
       fromPubkey: wallet,
       toPubkey: admin,
-      amountSol,
+      lamports,
     });
 
     const serialized = Buffer.from(
-      tx.serialize({ requireAllSignatures: false, verifySignatures: false }),
+      tx.serialize({ requireAllSignatures: false, verifySignatures: false })
     ).toString("base64");
 
-    res.json({ serialized, amountSol, admin: admin.toBase58(), eggType });
+    res.json({
+      serialized,
+      intentId,
+      amountSol,
+      lamports,
+      solUsd,
+      solUsdSource: source,
+      admin: admin.toBase58(),
+      eggType,
+      priceUsd,
+      expiresAt: expiresAt.toISOString(),
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -883,21 +907,33 @@ app.post("/api/buy-egg", requireAuth, async (req, res) => {
 // Confirm a signed payment and credit the egg
 app.post("/api/confirm-buy-egg", requireAuth, async (req, res) => {
   try {
-    const { eggType = "basic", signature } = req.body || {};
+    const { eggType = "basic", signature, intentId } = req.body || {};
     const wallet = req.auth?.wallet;
-    if (!wallet || !signature)
+    if (!wallet || !signature || !intentId)
       return res.status(400).json({ error: "missing fields" });
 
     const priceUsd = EGG_PRICE_USD[eggType];
     if (!priceUsd) return res.status(400).json({ error: "invalid eggType" });
 
-    const amountSol = usdToSol(priceUsd);
-    const minLamports = Math.round(amountSol * 1e9);
+    // Load intent quoted at tx-build time
+    const intent = await query(
+      `SELECT id, wallet, kind, price_usd, sol_usd, lamports, expires_at
+       FROM payment_intents
+       WHERE id = $1`,
+      [intentId]
+    );
+    if (intent.rowCount === 0) return res.status(400).json({ error: "invalid intent" });
+
+    const row = intent.rows[0];
+    if (row.wallet !== wallet) return res.status(403).json({ error: "intent wallet mismatch" });
+    if (row.kind !== `buy_egg:${eggType}`) return res.status(400).json({ error: "intent kind mismatch" });
+    if (new Date(row.expires_at).getTime() < Date.now()) return res.status(410).json({ error: "intent expired" });
+
+    const minLamports = Number(row.lamports);
+    const amountSol = lamportsToSol(minLamports);
 
     // Prevent replay
-    const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [
-      signature,
-    ]);
+    const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [signature]);
     if (already.rowCount > 0) {
       return res.status(409).json({ error: "payment already processed" });
     }
@@ -935,9 +971,12 @@ app.post("/api/confirm-buy-egg", requireAuth, async (req, res) => {
           wallet,
           `buy_egg:${eggType}`,
           amountSol,
-          JSON.stringify({ eggType }),
+          JSON.stringify({ eggType, intentId, solUsd: Number(row.sol_usd), priceUsd: Number(row.price_usd) }),
         ],
       );
+
+      // Intent is single-use
+      await query(`DELETE FROM payment_intents WHERE id=$1`, [intentId]);
 
       await query(
         `UPDATE users SET ${col} = COALESCE(${col}, 0) + 1 WHERE wallet = $1`,
@@ -950,7 +989,7 @@ app.post("/api/confirm-buy-egg", requireAuth, async (req, res) => {
       throw e;
     }
 
-    res.json({ ok: true, eggType, credited: 1, signature });
+    res.json({ ok: true, eggType, credited: 1, signature, amountSol });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -968,21 +1007,42 @@ app.post("/api/buy-spaceship", requireAuth, async (req, res) => {
     const priceUsd = SHIP_PRICE_USD[String(level)];
     if (!priceUsd) return res.status(400).json({ error: "invalid level" });
 
-    const amountSol = usdToSol(priceUsd);
+    const { solUsd, source } = await getSolUsdPrice();
+    const lamports = usdToLamports({ usd: priceUsd, solUsd });
+    const amountSol = lamportsToSol(lamports);
+
+    const intentId = nanoid(24);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    await query(
+      `INSERT INTO payment_intents (id, wallet, kind, price_usd, sol_usd, lamports, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [intentId, wallet, `buy_ship:${level}`, priceUsd, solUsd, String(lamports), expiresAt]
+    );
 
     const admin = new PublicKey(ADMIN_WALLET);
     const tx = await buildTransferTx({
       rpcUrl: RPC_URL,
       fromPubkey: wallet,
       toPubkey: admin,
-      amountSol,
+      lamports,
     });
 
     const serialized = Buffer.from(
-      tx.serialize({ requireAllSignatures: false, verifySignatures: false }),
+      tx.serialize({ requireAllSignatures: false, verifySignatures: false })
     ).toString("base64");
 
-    res.json({ serialized, amountSol, admin: admin.toBase58(), level });
+    res.json({
+      serialized,
+      intentId,
+      amountSol,
+      lamports,
+      solUsd,
+      solUsdSource: source,
+      admin: admin.toBase58(),
+      level,
+      priceUsd,
+      expiresAt: expiresAt.toISOString(),
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
@@ -992,20 +1052,31 @@ app.post("/api/buy-spaceship", requireAuth, async (req, res) => {
 // Confirm ship payment and set ship_level
 app.post("/api/confirm-buy-spaceship", requireAuth, async (req, res) => {
   try {
-    const { level, signature } = req.body || {};
+    const { level, signature, intentId } = req.body || {};
     const wallet = req.auth?.wallet;
-    if (!wallet || !level || !signature)
+    if (!wallet || !level || !signature || !intentId)
       return res.status(400).json({ error: "missing fields" });
 
     const priceUsd = SHIP_PRICE_USD[String(level)];
     if (!priceUsd) return res.status(400).json({ error: "invalid level" });
 
-    const amountSol = usdToSol(priceUsd);
-    const minLamports = Math.round(amountSol * 1e9);
+    const intent = await query(
+      `SELECT id, wallet, kind, price_usd, sol_usd, lamports, expires_at
+       FROM payment_intents
+       WHERE id = $1`,
+      [intentId]
+    );
+    if (intent.rowCount === 0) return res.status(400).json({ error: "invalid intent" });
 
-    const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [
-      signature,
-    ]);
+    const row = intent.rows[0];
+    if (row.wallet !== wallet) return res.status(403).json({ error: "intent wallet mismatch" });
+    if (row.kind !== `buy_ship:${level}`) return res.status(400).json({ error: "intent kind mismatch" });
+    if (new Date(row.expires_at).getTime() < Date.now()) return res.status(410).json({ error: "intent expired" });
+
+    const minLamports = Number(row.lamports);
+    const amountSol = lamportsToSol(minLamports);
+
+    const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [signature]);
     if (already.rowCount > 0) {
       return res.status(409).json({ error: "payment already processed" });
     }
@@ -1039,9 +1110,11 @@ app.post("/api/confirm-buy-spaceship", requireAuth, async (req, res) => {
           wallet,
           `buy_ship:${level}`,
           amountSol,
-          JSON.stringify({ level: Number(level) }),
+          JSON.stringify({ level: Number(level), intentId, solUsd: Number(row.sol_usd), priceUsd: Number(row.price_usd) }),
         ],
       );
+
+      await query(`DELETE FROM payment_intents WHERE id=$1`, [intentId]);
 
       await query(
         `UPDATE users SET ship_level = GREATEST(COALESCE(ship_level, 1), $1) WHERE wallet = $2`,

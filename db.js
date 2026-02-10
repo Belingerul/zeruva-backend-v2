@@ -216,6 +216,21 @@ async function initDb() {
     );
   `);
 
+  // 4a) payment intents (quote SOL amount at the time we build the tx)
+  // This prevents price changes between /buy-* and /confirm-* from breaking verification.
+  await query(`
+    CREATE TABLE IF NOT EXISTS payment_intents (
+      id TEXT PRIMARY KEY,
+      wallet TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      price_usd DOUBLE PRECISION NOT NULL,
+      sol_usd DOUBLE PRECISION NOT NULL,
+      lamports BIGINT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      expires_at TIMESTAMP NOT NULL
+    );
+  `);
+
   // 1e) egg credits (Option A: on-chain payment, off-chain inventory)
   await query(`
     DO $$

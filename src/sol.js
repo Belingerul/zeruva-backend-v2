@@ -7,18 +7,30 @@ const {
 
 /**
  * Build a SOL transfer tx for the user to sign.
- * amountSol: number (e.g. 0.3)
+ * Prefer passing an integer lamports amount to avoid rounding issues.
  */
-async function buildTransferTx({ rpcUrl, fromPubkey, toPubkey, amountSol }) {
+async function buildTransferTx({ rpcUrl, fromPubkey, toPubkey, lamports, amountSol }) {
   const connection = new Connection(rpcUrl, "confirmed");
   const { blockhash } = await connection.getLatestBlockhash();
 
-  const tx = new Transaction({ recentBlockhash: blockhash, feePayer: new PublicKey(fromPubkey) });
-  tx.add(SystemProgram.transfer({
-    fromPubkey: new PublicKey(fromPubkey),
-    toPubkey: new PublicKey(toPubkey),
-    lamports: Math.round(amountSol * 1e9),
-  }));
+  const tx = new Transaction({
+    recentBlockhash: blockhash,
+    feePayer: new PublicKey(fromPubkey),
+  });
+
+  const resolvedLamports = (() => {
+    if (Number.isFinite(lamports) && lamports > 0) return Math.floor(lamports);
+    if (Number.isFinite(amountSol) && amountSol > 0) return Math.ceil(amountSol * 1e9);
+    throw new Error("Missing transfer amount (lamports or amountSol)");
+  })();
+
+  tx.add(
+    SystemProgram.transfer({
+      fromPubkey: new PublicKey(fromPubkey),
+      toPubkey: new PublicKey(toPubkey),
+      lamports: resolvedLamports,
+    })
+  );
 
   return tx; // caller will serialize to base64 as needed
 }
