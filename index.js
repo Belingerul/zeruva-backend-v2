@@ -246,13 +246,21 @@ function calculateUnclaimedEarnings(lastClaimAt, totalRoiPerDay, now) {
 }
 
 async function calculateCurrentROI(wallet) {
+  // IMPORTANT: Only count aliens assigned to slots that are actually available for the user's current ship_level.
+  // Otherwise, old/stale assignments in higher slot indexes (e.g. from a previously-higher ship level)
+  // will incorrectly inflate ROI and rewards.
+  const userRes = await query(`SELECT ship_level FROM users WHERE wallet = $1`, [wallet]);
+  const level = Number(userRes.rows[0]?.ship_level || 1);
+  const maxSlots = LEVEL_SLOTS[level] || 2;
+
   const activeResult = await query(
     `SELECT a.roi
      FROM ship_slots s
      JOIN aliens a ON a.id = s.alien_fk
-     WHERE s.wallet = $1`,
-    [wallet]
+     WHERE s.wallet = $1 AND s.slot_index < $2`,
+    [wallet, maxSlots]
   );
+
   let totalRoiPerDay = 0;
   for (const row of activeResult.rows) {
     totalRoiPerDay += Number(row.roi);
@@ -580,21 +588,27 @@ app.get("/api/ship/:wallet", async (req, res) => {
   }
 });
 
-app.post("/api/upgrade-ship", async (req, res) => {
-  const { wallet, newLevel } = req.body;
+// Legacy endpoint (kept for compatibility): only allow the authenticated user to upgrade their own ship.
+// NOTE: Real upgrades should go through the paid flow + /confirm-buy-spaceship.
+app.post("/api/upgrade-ship", requireAuth, async (req, res) => {
+  const { newLevel } = req.body || {};
+  const wallet = req.auth?.wallet;
 
-  if (!wallet || !newLevel)
-    return res.status(400).json({ error: "Missing fields" });
+  if (!wallet || !newLevel) return res.status(400).json({ error: "Missing fields" });
 
   try {
+    const lvl = Number(newLevel);
+    if (![1, 2, 3].includes(lvl)) return res.status(400).json({ error: "Invalid level" });
+
+    // Prevent downgrades (downgrades can hide slots and cause ROI confusion)
     await query(
       `UPDATE users
-       SET ship_level = $1
+       SET ship_level = GREATEST(COALESCE(ship_level, 1), $1)
        WHERE wallet = $2`,
-      [newLevel, wallet]
+      [lvl, wallet]
     );
 
-    res.json({ ok: true });
+    res.json({ ok: true, level: lvl });
   } catch (e) {
     console.log(e);
     res.status(500).json({ error: e.message });
