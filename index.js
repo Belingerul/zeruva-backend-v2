@@ -9,7 +9,7 @@ const jwt = require("jsonwebtoken");
 const nacl = require("tweetnacl");
 const bs58 = require("bs58").default;
 const { nanoid } = require("nanoid");
-const { PublicKey } = require("@solana/web3.js");
+const { PublicKey, Keypair, Connection, SystemProgram, Transaction } = require("@solana/web3.js");
 const { buildTransferTx, verifySolPayment } = require("./src/sol");
 const { getSolUsdPrice, usdToLamports } = require("./src/pricing");
 const { initDb, query } = require("./db");
@@ -73,6 +73,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use("/static", express.static(path.join(__dirname, "public")));
 
 const ADMIN_WALLET = process.env.ADMIN_WALLET;
+const DEV_WALLET_SECRET_KEY = process.env.DEV_WALLET_SECRET_KEY;
 const RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || "";
 const ALIEN_COUNT = parseInt(process.env.ALIEN_COUNT || "60", 10);
@@ -213,6 +214,76 @@ const SHIP_PRICE_USD = {
 
 function lamportsToSol(lamports) {
   return Number(lamports) / 1e9;
+}
+
+function parseSecretKeyBytes(secret) {
+  if (!secret) return null;
+  const trimmed = String(secret).trim();
+  if (!trimmed) return null;
+
+  // JSON array of numbers
+  if (trimmed.startsWith("[")) {
+    const arr = JSON.parse(trimmed);
+    if (!Array.isArray(arr)) throw new Error("DEV_WALLET_SECRET_KEY JSON must be an array");
+    return Uint8Array.from(arr);
+  }
+
+  // base58-encoded secretKey bytes
+  return bs58.decode(trimmed);
+}
+
+let _devKeypair = null;
+function getDevKeypair() {
+  if (_devKeypair) return _devKeypair;
+  if (!DEV_WALLET_SECRET_KEY) {
+    throw new Error("Server misconfigured: DEV_WALLET_SECRET_KEY not set");
+  }
+  const bytes = parseSecretKeyBytes(DEV_WALLET_SECRET_KEY);
+  if (!bytes || bytes.length < 32) {
+    throw new Error("Server misconfigured: DEV_WALLET_SECRET_KEY invalid");
+  }
+  _devKeypair = Keypair.fromSecretKey(bytes);
+
+  // Optional safety check: ensure it matches ADMIN_WALLET if provided.
+  if (ADMIN_WALLET) {
+    const expected = new PublicKey(ADMIN_WALLET).toBase58();
+    const actual = _devKeypair.publicKey.toBase58();
+    if (expected !== actual) {
+      throw new Error(
+        `DEV_WALLET_SECRET_KEY pubkey (${actual}) does not match ADMIN_WALLET (${expected})`
+      );
+    }
+  }
+
+  return _devKeypair;
+}
+
+async function sendSolPayout({ rpcUrl, toPubkey, lamports }) {
+  const payer = getDevKeypair();
+  const connection = new Connection(rpcUrl, "confirmed");
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+
+  const tx = new Transaction({
+    recentBlockhash: blockhash,
+    feePayer: payer.publicKey,
+  });
+
+  tx.add(
+    SystemProgram.transfer({
+      fromPubkey: payer.publicKey,
+      toPubkey: new PublicKey(toPubkey),
+      lamports: Math.floor(Number(lamports)),
+    })
+  );
+
+  const sig = await connection.sendTransaction(tx, [payer], {
+    skipPreflight: false,
+    preflightCommitment: "confirmed",
+    maxRetries: 3,
+  });
+
+  await connection.confirmTransaction(sig, "confirmed");
+  return sig;
 }
 
 function eggColumn(eggType) {
@@ -431,6 +502,152 @@ app.post("/api/claim-rewards", requireAuth, async (req, res) => {
     }
   } catch (e) {
     console.error("POST /api/claim-rewards error", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Claim payouts (server sends SOL from DEV wallet) ---
+app.post("/api/claim-sol-intent", requireAuth, async (req, res) => {
+  try {
+    const { expected_earnings } = req.body || {};
+    const wallet = req.auth?.wallet;
+    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
+
+    const now = new Date();
+
+    // ensure user exists
+    await query(
+      `INSERT INTO users (wallet)
+       VALUES ($1)
+       ON CONFLICT (wallet) DO NOTHING`,
+      [wallet]
+    );
+
+    const userRes = await query(
+      `SELECT last_claim_at, pending_earnings
+       FROM users
+       WHERE wallet=$1`,
+      [wallet]
+    );
+
+    const user = userRes.rows[0];
+    const totalRoiPerDay = await calculateCurrentROI(wallet);
+    const newEarnings = calculateUnclaimedEarnings(user.last_claim_at, totalRoiPerDay, now);
+    const pendingEarnings = Number(user.pending_earnings || 0);
+    const totalToClaimUsd = pendingEarnings + newEarnings;
+
+    const CLAIM_TOLERANCE = Number(process.env.CLAIM_TOLERANCE || "0.05");
+    if (expected_earnings !== undefined && expected_earnings !== null) {
+      const expectedNum = Number(expected_earnings);
+      const diff = Math.abs(totalToClaimUsd - expectedNum);
+      if (diff > CLAIM_TOLERANCE) {
+        return res.status(400).json({
+          error: "Earnings mismatch",
+          server_calculated: Number(totalToClaimUsd.toFixed(6)),
+          client_expected: Number(expectedNum.toFixed(6)),
+          diff: Number(diff.toFixed(6)),
+          tolerance: CLAIM_TOLERANCE,
+        });
+      }
+    }
+
+    if (totalToClaimUsd <= 0) {
+      return res.json({ ok: true, intentId: null, earningsUsd: 0, lamports: 0, amountSol: 0 });
+    }
+
+    const { solUsd, source } = await getSolUsdPrice();
+    const lamports = usdToLamports({ usd: totalToClaimUsd, solUsd });
+    const amountSol = lamportsToSol(lamports);
+
+    const intentId = nanoid(24);
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+    await query(
+      `INSERT INTO claim_intents (id, wallet, earnings_usd, sol_usd, lamports, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [intentId, wallet, totalToClaimUsd, solUsd, String(lamports), expiresAt]
+    );
+
+    return res.json({
+      ok: true,
+      intentId,
+      earningsUsd: Number(totalToClaimUsd.toFixed(6)),
+      lamports,
+      amountSol,
+      solUsd,
+      solUsdSource: source,
+      expiresAt: expiresAt.toISOString(),
+      to: wallet,
+      from: ADMIN_WALLET || null,
+    });
+  } catch (e) {
+    console.error("POST /api/claim-sol-intent error", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/confirm-claim-sol", requireAuth, async (req, res) => {
+  try {
+    const { intentId } = req.body || {};
+    const wallet = req.auth?.wallet;
+    if (!wallet || !intentId) return res.status(400).json({ error: "missing fields" });
+
+    const intentRes = await query(
+      `SELECT id, wallet, earnings_usd, lamports, expires_at, status, tx_signature
+       FROM claim_intents
+       WHERE id=$1`,
+      [intentId]
+    );
+
+    if (intentRes.rowCount === 0) return res.status(400).json({ error: "invalid intent" });
+    const intent = intentRes.rows[0];
+
+    if (intent.wallet !== wallet) return res.status(403).json({ error: "intent wallet mismatch" });
+    if (new Date(intent.expires_at).getTime() < Date.now()) return res.status(410).json({ error: "intent expired" });
+
+    if (intent.status === "paid") {
+      return res.json({ ok: true, signature: intent.tx_signature, alreadyPaid: true });
+    }
+
+    const lamports = Number(intent.lamports);
+    if (!Number.isFinite(lamports) || lamports <= 0) {
+      return res.status(400).json({ error: "invalid lamports" });
+    }
+
+    // Perform on-chain payout first, then finalize accounting in DB.
+    const signature = await sendSolPayout({ rpcUrl: RPC_URL, toPubkey: wallet, lamports });
+
+    await query("BEGIN");
+    try {
+      const now = new Date();
+
+      // Mark intent paid (idempotency guard)
+      await query(
+        `UPDATE claim_intents
+         SET status='paid', tx_signature=$1, paid_at=$2
+         WHERE id=$3`,
+        [signature, now, intentId]
+      );
+
+      // Advance claim state (claim-all)
+      await query(
+        `UPDATE users
+         SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
+             pending_earnings = 0,
+             last_claim_at = $2
+         WHERE wallet = $3`,
+        [Number(intent.earnings_usd), now, wallet]
+      );
+
+      await query("COMMIT");
+    } catch (e) {
+      await query("ROLLBACK").catch(() => {});
+      throw e;
+    }
+
+    return res.json({ ok: true, signature });
+  } catch (e) {
+    console.error("POST /api/confirm-claim-sol error", e);
     res.status(500).json({ error: e.message });
   }
 });

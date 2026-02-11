@@ -231,6 +231,22 @@ async function initDb() {
     );
   `);
 
+  // 4b) claim intents + payout tracking (server pays SOL from dev wallet)
+  await query(`
+    CREATE TABLE IF NOT EXISTS claim_intents (
+      id TEXT PRIMARY KEY,
+      wallet TEXT NOT NULL,
+      earnings_usd DOUBLE PRECISION NOT NULL,
+      sol_usd DOUBLE PRECISION NOT NULL,
+      lamports BIGINT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      expires_at TIMESTAMP NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      tx_signature TEXT,
+      paid_at TIMESTAMP
+    );
+  `);
+
   // 1e) egg credits (Option A: on-chain payment, off-chain inventory)
   await query(`
     DO $$
