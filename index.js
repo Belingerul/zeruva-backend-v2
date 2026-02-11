@@ -657,6 +657,16 @@ app.get("/api/health", (_, res) => {
   res.json({ ok: true, aliens: ALIEN_COUNT });
 });
 
+// Price helper (used by frontend to show SOL/USD quote without creating an intent)
+app.get("/api/price/sol-usd", async (_req, res) => {
+  try {
+    const { solUsd, source } = await getSolUsdPrice();
+    res.json({ ok: true, solUsd, source, ts: Date.now() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Get a nonce to sign for login
 app.post("/api/auth/nonce", (req, res) => {
   const { wallet } = req.body || {};
