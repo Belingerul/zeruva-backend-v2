@@ -76,6 +76,9 @@ const ADMIN_WALLET = process.env.ADMIN_WALLET;
 const DEV_WALLET_SECRET_KEY = process.env.DEV_WALLET_SECRET_KEY;
 const RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || "";
+
+// Claim cooldown (default: 24h)
+const CLAIM_COOLDOWN_MS = Number(process.env.CLAIM_COOLDOWN_MS || 24 * 60 * 60 * 1000);
 const ALIEN_COUNT = parseInt(process.env.ALIEN_COUNT || "60", 10);
 
 // ===== Auth (Solana signature -> JWT) =====
@@ -383,11 +386,17 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
 
     const totalPending = Number(user.pending_earnings || 0) + Number(unclaimedEarnings);
 
+    const lastClaimAt = user.last_claim_at ? new Date(user.last_claim_at) : null;
+    const nextClaimAt = lastClaimAt && CLAIM_COOLDOWN_MS > 0
+      ? new Date(lastClaimAt.getTime() + CLAIM_COOLDOWN_MS)
+      : null;
+
     return res.json({
       unclaimed_earnings: Number(unclaimedEarnings),
       pending_earnings: Number(user.pending_earnings || 0),
       total_claimed_points: Number(user.total_claimed_points || 0),
       last_claim_at: user.last_claim_at,
+      next_claim_at: nextClaimAt ? nextClaimAt.toISOString() : null,
       total_roi_per_day: totalRoiPerDay,
       base_points_per_day: BASE_POINTS_PER_DAY,
     });
@@ -435,6 +444,20 @@ app.post("/api/claim-rewards", requireAuth, async (req, res) => {
           total_claimed_points: 0,
           message: "First time claim, starting timer now.",
         });
+      }
+
+      // Enforce 24h claim cooldown (server-authoritative)
+      if (user.last_claim_at && CLAIM_COOLDOWN_MS > 0) {
+        const last = new Date(user.last_claim_at);
+        const next = new Date(last.getTime() + CLAIM_COOLDOWN_MS);
+        if (Date.now() < next.getTime()) {
+          await query("ROLLBACK");
+          return res.status(429).json({
+            error: "Claim cooldown",
+            next_claim_at: next.toISOString(),
+            seconds_left: Math.ceil((next.getTime() - Date.now()) / 1000),
+          });
+        }
       }
 
       const totalRoiPerDay = await calculateCurrentROI(wallet);
@@ -531,6 +554,21 @@ app.post("/api/claim-sol-intent", requireAuth, async (req, res) => {
     );
 
     const user = userRes.rows[0];
+
+    // Enforce 24h claim cooldown (server-authoritative)
+    const lastClaimAt = user.last_claim_at ? new Date(user.last_claim_at) : null;
+    if (lastClaimAt && CLAIM_COOLDOWN_MS > 0) {
+      const nextClaimAt = new Date(lastClaimAt.getTime() + CLAIM_COOLDOWN_MS);
+      if (Date.now() < nextClaimAt.getTime()) {
+        const secondsLeft = Math.ceil((nextClaimAt.getTime() - Date.now()) / 1000);
+        return res.status(429).json({
+          error: "Claim cooldown",
+          next_claim_at: nextClaimAt.toISOString(),
+          seconds_left: secondsLeft,
+        });
+      }
+    }
+
     const totalRoiPerDay = await calculateCurrentROI(wallet);
     const newEarnings = calculateUnclaimedEarnings(user.last_claim_at, totalRoiPerDay, now);
     const pendingEarnings = Number(user.pending_earnings || 0);
