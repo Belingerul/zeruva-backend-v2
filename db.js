@@ -248,31 +248,41 @@ async function initDb() {
   `);
 
   // 1e) egg credits (Option A: on-chain payment, off-chain inventory)
-  await query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'users' AND column_name = 'eggs_basic'
-      ) THEN
-        ALTER TABLE users ADD COLUMN eggs_basic INTEGER DEFAULT 0;
-      END IF;
+  if (USING_PGMEM) {
+    // pg-mem doesn't support DO $$ plpgsql blocks.
+    // Best-effort add columns (ignore errors if they already exist).
+    for (const col of ["eggs_basic", "eggs_rare", "eggs_ultra"]) {
+      try {
+        await query(`ALTER TABLE users ADD COLUMN ${col} INTEGER DEFAULT 0;`);
+      } catch (_) {}
+    }
+  } else {
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'eggs_basic'
+        ) THEN
+          ALTER TABLE users ADD COLUMN eggs_basic INTEGER DEFAULT 0;
+        END IF;
 
-      IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'users' AND column_name = 'eggs_rare'
-      ) THEN
-        ALTER TABLE users ADD COLUMN eggs_rare INTEGER DEFAULT 0;
-      END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'eggs_rare'
+        ) THEN
+          ALTER TABLE users ADD COLUMN eggs_rare INTEGER DEFAULT 0;
+        END IF;
 
-      IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'users' AND column_name = 'eggs_ultra'
-      ) THEN
-        ALTER TABLE users ADD COLUMN eggs_ultra INTEGER DEFAULT 0;
-      END IF;
-    END$$;
-  `);
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'eggs_ultra'
+        ) THEN
+          ALTER TABLE users ADD COLUMN eggs_ultra INTEGER DEFAULT 0;
+        END IF;
+      END$$;
+    `);
+  }
 
   console.log("✅ Database tables ensured/created");
 }
