@@ -450,6 +450,7 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
       pending_earnings: Number(user.pending_earnings || 0),
       total_claimed_points: Number(user.total_claimed_points || 0),
       last_claim_at: user.last_claim_at,
+      last_accrual_at: user.last_accrual_at,
       next_claim_at: nextClaimAt ? nextClaimAt.toISOString() : null,
       expedition_active: !!user.expedition_active,
       expedition_started_at: user.expedition_started_at,
@@ -953,13 +954,19 @@ app.post("/api/assign-slot", requireAuth, async (req, res) => {
     
     const now = new Date();
     const userResult = await query(
-      `SELECT last_claim_at, last_accrual_at, total_claimed_points, pending_earnings
+      `SELECT last_claim_at, last_accrual_at, expedition_active, expedition_ends_at, total_claimed_points, pending_earnings
        FROM users
        WHERE wallet = $1`,
       [wallet]
     );
     
     let user = userResult.rows[0];
+
+    // Lock assignments while on expedition
+    if (user?.expedition_active && user?.expedition_ends_at && new Date(user.expedition_ends_at).getTime() > Date.now()) {
+      await query("ROLLBACK");
+      return res.status(409).json({ error: "Cannot change assignments during expedition" });
+    }
     if (!user) {
       await query(
         `INSERT INTO users (wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings)
@@ -1023,7 +1030,7 @@ app.post("/api/unassign-slot", requireAuth, async (req, res) => {
 
     const now = new Date();
     const userResult = await query(
-      `SELECT last_claim_at, last_accrual_at, total_claimed_points, pending_earnings
+      `SELECT last_claim_at, last_accrual_at, expedition_active, expedition_ends_at, total_claimed_points, pending_earnings
        FROM users
        WHERE wallet = $1`,
       [wallet]
@@ -1033,6 +1040,12 @@ app.post("/api/unassign-slot", requireAuth, async (req, res) => {
     if (!user) {
       await query("ROLLBACK");
       return res.status(404).json({ error: "User not found" });
+    }
+
+    // Lock assignments while on expedition
+    if (user?.expedition_active && user?.expedition_ends_at && new Date(user.expedition_ends_at).getTime() > Date.now()) {
+      await query("ROLLBACK");
+      return res.status(409).json({ error: "Cannot change assignments during expedition" });
     }
 
     const oldROI = await calculateCurrentROI(wallet);
