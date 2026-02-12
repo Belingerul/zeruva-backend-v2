@@ -358,7 +358,7 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
     const now = new Date();
 
     let userResult = await query(
-      `SELECT wallet, last_claim_at, total_claimed_points, pending_earnings
+      `SELECT wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings
        FROM users
        WHERE wallet = $1`,
       [wallet]
@@ -368,9 +368,9 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
 
     if (!user) {
       const insertResult = await query(
-        `INSERT INTO users (wallet, last_claim_at, total_claimed_points, pending_earnings)
-         VALUES ($1, $2, 0, 0)
-         RETURNING wallet, last_claim_at, total_claimed_points, pending_earnings`,
+        `INSERT INTO users (wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings)
+         VALUES ($1, $2, $2, 0, 0)
+         RETURNING wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings`,
         [wallet, now]
       );
       user = insertResult.rows[0];
@@ -378,8 +378,10 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
 
     const totalRoiPerDay = await calculateCurrentROI(wallet);
 
+    const accrualBase = user.last_accrual_at || user.last_claim_at;
+
     const unclaimedEarnings = calculateUnclaimedEarnings(
-      user.last_claim_at,
+      accrualBase,
       totalRoiPerDay,
       now
     );
@@ -422,7 +424,7 @@ app.post("/api/claim-rewards", requireAuth, async (req, res) => {
       const now = new Date();
 
       let userResult = await query(
-        `SELECT wallet, last_claim_at, total_claimed_points, pending_earnings
+        `SELECT wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings
          FROM users
          WHERE wallet = $1`,
         [wallet]
@@ -432,9 +434,9 @@ app.post("/api/claim-rewards", requireAuth, async (req, res) => {
 
       if (!user) {
         const insertResult = await query(
-          `INSERT INTO users (wallet, last_claim_at, total_claimed_points, pending_earnings)
-           VALUES ($1, $2, 0, 0)
-           RETURNING wallet, last_claim_at, total_claimed_points, pending_earnings`,
+          `INSERT INTO users (wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings)
+           VALUES ($1, $2, $2, 0, 0)
+           RETURNING wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings`,
           [wallet, now]
         );
         await query("COMMIT");
@@ -462,8 +464,9 @@ app.post("/api/claim-rewards", requireAuth, async (req, res) => {
 
       const totalRoiPerDay = await calculateCurrentROI(wallet);
 
+      const accrualBase = user.last_accrual_at || user.last_claim_at;
       const newEarnings = calculateUnclaimedEarnings(
-        user.last_claim_at,
+        accrualBase,
         totalRoiPerDay,
         now
       );
@@ -547,7 +550,7 @@ app.post("/api/claim-sol-intent", requireAuth, async (req, res) => {
     );
 
     const userRes = await query(
-      `SELECT last_claim_at, pending_earnings
+      `SELECT last_claim_at, last_accrual_at, pending_earnings
        FROM users
        WHERE wallet=$1`,
       [wallet]
@@ -570,7 +573,8 @@ app.post("/api/claim-sol-intent", requireAuth, async (req, res) => {
     }
 
     const totalRoiPerDay = await calculateCurrentROI(wallet);
-    const newEarnings = calculateUnclaimedEarnings(user.last_claim_at, totalRoiPerDay, now);
+    const accrualBase = user.last_accrual_at || user.last_claim_at;
+    const newEarnings = calculateUnclaimedEarnings(accrualBase, totalRoiPerDay, now);
     const pendingEarnings = Number(user.pending_earnings || 0);
     const totalToClaimUsd = pendingEarnings + newEarnings;
 
@@ -672,7 +676,8 @@ app.post("/api/confirm-claim-sol", requireAuth, async (req, res) => {
         `UPDATE users
          SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
              pending_earnings = 0,
-             last_claim_at = $2
+             last_claim_at = $2,
+             last_accrual_at = $2
          WHERE wallet = $3`,
         [Number(intent.earnings_usd), now, wallet]
       );
@@ -892,7 +897,7 @@ app.post("/api/assign-slot", requireAuth, async (req, res) => {
     
     const now = new Date();
     const userResult = await query(
-      `SELECT last_claim_at, total_claimed_points, pending_earnings
+      `SELECT last_claim_at, last_accrual_at, total_claimed_points, pending_earnings
        FROM users
        WHERE wallet = $1`,
       [wallet]
@@ -901,14 +906,14 @@ app.post("/api/assign-slot", requireAuth, async (req, res) => {
     let user = userResult.rows[0];
     if (!user) {
       await query(
-        `INSERT INTO users (wallet, last_claim_at, total_claimed_points, pending_earnings)
-         VALUES ($1, $2, 0, 0)
+        `INSERT INTO users (wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings)
+         VALUES ($1, $2, $2, 0, 0)
          ON CONFLICT (wallet) DO NOTHING
-         RETURNING last_claim_at, total_claimed_points, pending_earnings`,
+         RETURNING last_claim_at, last_accrual_at, total_claimed_points, pending_earnings`,
         [wallet, now]
       );
       const newUserResult = await query(
-        `SELECT last_claim_at, total_claimed_points, pending_earnings
+        `SELECT last_claim_at, last_accrual_at, total_claimed_points, pending_earnings
          FROM users WHERE wallet = $1`,
         [wallet]
       );
@@ -918,18 +923,18 @@ app.post("/api/assign-slot", requireAuth, async (req, res) => {
     const oldROI = await calculateCurrentROI(wallet);
 
     let earnings = 0;
-    if (oldROI > 0 && user.last_claim_at) {
-      earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
+    const accrualBase = user.last_accrual_at || user.last_claim_at;
+    if (oldROI > 0 && accrualBase) {
+      earnings = calculateUnclaimedEarnings(accrualBase, oldROI, now);
       if (earnings < 0) earnings = 0;
     }
 
-    // CRITICAL: Always advance last_claim_at when ROI changes.
-    // Otherwise, after an assign/unassign, /api/rewards will accrue with the NEW ROI
-    // starting from an OLD last_claim_at → "ghost" earnings.
+    // IMPORTANT: ROI changes should NOT reset claim cooldown.
+    // We advance last_accrual_at (earnings baseline) while keeping last_claim_at intact.
     await query(
       `UPDATE users
        SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
-           last_claim_at = $2
+           last_accrual_at = $2
        WHERE wallet = $3`,
       [earnings, now, wallet]
     );
@@ -962,7 +967,7 @@ app.post("/api/unassign-slot", requireAuth, async (req, res) => {
 
     const now = new Date();
     const userResult = await query(
-      `SELECT last_claim_at, total_claimed_points, pending_earnings
+      `SELECT last_claim_at, last_accrual_at, total_claimed_points, pending_earnings
        FROM users
        WHERE wallet = $1`,
       [wallet]
@@ -977,18 +982,18 @@ app.post("/api/unassign-slot", requireAuth, async (req, res) => {
     const oldROI = await calculateCurrentROI(wallet);
 
     let earnings = 0;
-    if (oldROI > 0 && user.last_claim_at) {
-      earnings = calculateUnclaimedEarnings(user.last_claim_at, oldROI, now);
+    const accrualBase = user.last_accrual_at || user.last_claim_at;
+    if (oldROI > 0 && accrualBase) {
+      earnings = calculateUnclaimedEarnings(accrualBase, oldROI, now);
       if (earnings < 0) earnings = 0;
     }
 
-    // CRITICAL: Always advance last_claim_at when ROI changes.
-    // Otherwise, after an assign/unassign, /api/rewards will accrue with the NEW ROI
-    // starting from an OLD last_claim_at → "ghost" earnings.
+    // IMPORTANT: ROI changes should NOT reset claim cooldown.
+    // We advance last_accrual_at (earnings baseline) while keeping last_claim_at intact.
     await query(
       `UPDATE users
        SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
-           last_claim_at = $2
+           last_accrual_at = $2
        WHERE wallet = $3`,
       [earnings, now, wallet]
     );

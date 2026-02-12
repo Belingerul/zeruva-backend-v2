@@ -53,9 +53,16 @@ async function initDb() {
         expedition_active BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW(),
         last_claim_at TIMESTAMP DEFAULT NOW(),
+        last_accrual_at TIMESTAMP DEFAULT NOW(),
         total_claimed_points NUMERIC(30, 10) DEFAULT 0,
         pending_earnings NUMERIC(30, 10) DEFAULT 0
       );
+
+      -- Ensure new columns exist even if dev schema changes between runs
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_accrual_at TIMESTAMP DEFAULT NOW();
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS eggs_basic INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS eggs_rare INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS eggs_ultra INTEGER DEFAULT 0;
     `);
   } else {
     await query(`
@@ -77,6 +84,20 @@ async function initDb() {
         ) THEN
           ALTER TABLE users
           ADD COLUMN last_claim_at TIMESTAMP DEFAULT NOW();
+        END IF;
+      END$$;
+    `);
+
+    // 1a.1) ensure last_accrual_at column exists (earnings accumulation baseline)
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'last_accrual_at'
+        ) THEN
+          ALTER TABLE users
+          ADD COLUMN last_accrual_at TIMESTAMP DEFAULT NOW();
         END IF;
       END$$;
     `);
