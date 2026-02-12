@@ -319,7 +319,7 @@ function calculateUnclaimedEarnings(lastClaimAt, totalRoiPerDay, now) {
   return Math.round(earnings * 1000000) / 1000000;
 }
 
-async function calculateCurrentROI(wallet) {
+async function calculateAssignedROI(wallet) {
   // IMPORTANT: Only count aliens assigned to slots that are actually available for the user's current ship_level.
   // Otherwise, old/stale assignments in higher slot indexes (e.g. from a previously-higher ship level)
   // will incorrectly inflate ROI and rewards.
@@ -342,6 +342,55 @@ async function calculateCurrentROI(wallet) {
   return totalRoiPerDay;
 }
 
+async function settleExpiredExpedition(wallet, now) {
+  // If an expedition expired while the user was offline, settle earnings up to ends_at,
+  // then turn expedition off. This preserves the 24h claim timer (last_claim_at).
+  const uRes = await query(
+    `SELECT expedition_active, expedition_ends_at, last_accrual_at, last_claim_at, pending_earnings
+     FROM users WHERE wallet=$1`,
+    [wallet]
+  );
+  if (uRes.rowCount === 0) return;
+  const u = uRes.rows[0];
+  if (!u.expedition_active || !u.expedition_ends_at) return;
+
+  const endsAt = new Date(u.expedition_ends_at);
+  if (now.getTime() <= endsAt.getTime()) return;
+
+  const roi = await calculateAssignedROI(wallet);
+  const accrualBase = u.last_accrual_at || u.last_claim_at;
+  const earned = calculateUnclaimedEarnings(accrualBase, roi, endsAt);
+
+  await query(
+    `UPDATE users
+     SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
+         expedition_active = FALSE,
+         expedition_ends_at = NULL,
+         expedition_started_at = NULL,
+         expedition_planet = NULL,
+         last_accrual_at = $2
+     WHERE wallet=$3`,
+    [earned, endsAt, wallet]
+  );
+}
+
+async function calculateCurrentROI(wallet) {
+  // EARNINGS RULE: Only earn while on expedition, and only with assigned aliens.
+  const uRes = await query(
+    `SELECT expedition_active, expedition_ends_at
+     FROM users WHERE wallet=$1`,
+    [wallet]
+  );
+  const u = uRes.rows[0];
+  const active = !!u?.expedition_active;
+  const endsAt = u?.expedition_ends_at ? new Date(u.expedition_ends_at) : null;
+
+  if (!active) return 0;
+  if (endsAt && Date.now() > endsAt.getTime()) return 0;
+
+  return await calculateAssignedROI(wallet);
+}
+
 app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
   try {
     const { wallet } = req.params;
@@ -358,7 +407,7 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
     const now = new Date();
 
     let userResult = await query(
-      `SELECT wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings
+      `SELECT wallet, last_claim_at, last_accrual_at, expedition_active, expedition_started_at, expedition_ends_at, expedition_planet, total_claimed_points, pending_earnings
        FROM users
        WHERE wallet = $1`,
       [wallet]
@@ -368,13 +417,16 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
 
     if (!user) {
       const insertResult = await query(
-        `INSERT INTO users (wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings)
-         VALUES ($1, $2, $2, 0, 0)
-         RETURNING wallet, last_claim_at, last_accrual_at, total_claimed_points, pending_earnings`,
+        `INSERT INTO users (wallet, last_claim_at, last_accrual_at, expedition_active, total_claimed_points, pending_earnings)
+         VALUES ($1, $2, $2, FALSE, 0, 0)
+         RETURNING wallet, last_claim_at, last_accrual_at, expedition_active, expedition_started_at, expedition_ends_at, expedition_planet, total_claimed_points, pending_earnings`,
         [wallet, now]
       );
       user = insertResult.rows[0];
     }
+
+    // Settle expeditions that may have expired while user was offline
+    await settleExpiredExpedition(wallet, now);
 
     const totalRoiPerDay = await calculateCurrentROI(wallet);
 
@@ -399,6 +451,10 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
       total_claimed_points: Number(user.total_claimed_points || 0),
       last_claim_at: user.last_claim_at,
       next_claim_at: nextClaimAt ? nextClaimAt.toISOString() : null,
+      expedition_active: !!user.expedition_active,
+      expedition_started_at: user.expedition_started_at,
+      expedition_ends_at: user.expedition_ends_at,
+      expedition_planet: user.expedition_planet,
       total_roi_per_day: totalRoiPerDay,
       base_points_per_day: BASE_POINTS_PER_DAY,
     });
@@ -1034,6 +1090,104 @@ app.post("/api/register", requireAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== Expeditions =====
+const EXPEDITION_DURATION_MS = 6 * 60 * 60 * 1000;
+
+app.get("/api/expedition/status", requireAuth, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
+
+    const now = new Date();
+    await settleExpiredExpedition(wallet, now);
+
+    const r = await query(
+      `SELECT expedition_active, expedition_started_at, expedition_ends_at, expedition_planet
+       FROM users WHERE wallet=$1`,
+      [wallet]
+    );
+
+    const u = r.rows[0] || {};
+    return res.json({
+      ok: true,
+      expedition_active: !!u.expedition_active,
+      expedition_started_at: u.expedition_started_at,
+      expedition_ends_at: u.expedition_ends_at,
+      expedition_planet: u.expedition_planet,
+    });
+  } catch (e) {
+    console.error("GET /api/expedition/status error", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/expedition/start", requireAuth, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
+
+    const planet = String(req.body?.planet || "planet-1");
+    const now = new Date();
+
+    await query("BEGIN");
+    try {
+      // Ensure user exists
+      await query(
+        `INSERT INTO users (wallet)
+         VALUES ($1)
+         ON CONFLICT (wallet) DO NOTHING`,
+        [wallet]
+      );
+
+      const uRes = await query(
+        `SELECT expedition_active, expedition_ends_at, last_accrual_at, last_claim_at, pending_earnings
+         FROM users WHERE wallet=$1`,
+        [wallet]
+      );
+      const u = uRes.rows[0];
+
+      if (u?.expedition_active && u?.expedition_ends_at && new Date(u.expedition_ends_at).getTime() > Date.now()) {
+        await query("ROLLBACK");
+        return res.status(409).json({
+          error: "Expedition already active",
+          expedition_ends_at: u.expedition_ends_at,
+        });
+      }
+
+      // settle any expired expedition first
+      await settleExpiredExpedition(wallet, now);
+
+      // Accrue earnings up to now using the OLD rate (likely 0 if not on expedition)
+      const oldROI = await calculateCurrentROI(wallet);
+      const accrualBase = u?.last_accrual_at || u?.last_claim_at;
+      const earned = calculateUnclaimedEarnings(accrualBase, oldROI, now);
+
+      const endsAt = new Date(now.getTime() + EXPEDITION_DURATION_MS);
+
+      await query(
+        `UPDATE users
+         SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
+             expedition_active = TRUE,
+             expedition_started_at = $2,
+             expedition_ends_at = $3,
+             expedition_planet = $4,
+             last_accrual_at = $2
+         WHERE wallet=$5`,
+        [earned, now, endsAt, planet, wallet]
+      );
+
+      await query("COMMIT");
+      return res.json({ ok: true, expedition_active: true, expedition_started_at: now.toISOString(), expedition_ends_at: endsAt.toISOString(), expedition_planet: planet });
+    } catch (e) {
+      await query("ROLLBACK").catch(() => {});
+      throw e;
+    }
+  } catch (e) {
+    console.error("POST /api/expedition/start error", e);
     res.status(500).json({ error: e.message });
   }
 });

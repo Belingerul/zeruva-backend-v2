@@ -51,6 +51,9 @@ async function initDb() {
         wallet TEXT PRIMARY KEY,
         ship_level INTEGER DEFAULT 1,
         expedition_active BOOLEAN DEFAULT FALSE,
+        expedition_started_at TIMESTAMP,
+        expedition_ends_at TIMESTAMP,
+        expedition_planet TEXT,
         created_at TIMESTAMP DEFAULT NOW(),
         last_claim_at TIMESTAMP DEFAULT NOW(),
         last_accrual_at TIMESTAMP DEFAULT NOW(),
@@ -60,6 +63,9 @@ async function initDb() {
 
       -- Ensure new columns exist even if dev schema changes between runs
       ALTER TABLE users ADD COLUMN IF NOT EXISTS last_accrual_at TIMESTAMP DEFAULT NOW();
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS expedition_started_at TIMESTAMP;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS expedition_ends_at TIMESTAMP;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS expedition_planet TEXT;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS eggs_basic INTEGER DEFAULT 0;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS eggs_rare INTEGER DEFAULT 0;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS eggs_ultra INTEGER DEFAULT 0;
@@ -72,6 +78,44 @@ async function initDb() {
         expedition_active BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT NOW()
       );
+    `);
+
+    // ensure expedition columns exist
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'expedition_active'
+        ) THEN
+          ALTER TABLE users
+          ADD COLUMN expedition_active BOOLEAN DEFAULT FALSE;
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'expedition_started_at'
+        ) THEN
+          ALTER TABLE users
+          ADD COLUMN expedition_started_at TIMESTAMP;
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'expedition_ends_at'
+        ) THEN
+          ALTER TABLE users
+          ADD COLUMN expedition_ends_at TIMESTAMP;
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'expedition_planet'
+        ) THEN
+          ALTER TABLE users
+          ADD COLUMN expedition_planet TEXT;
+        END IF;
+      END$$;
     `);
 
     // 1a) ensure last_claim_at column exists
