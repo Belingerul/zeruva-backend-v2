@@ -1137,6 +1137,7 @@ app.get("/api/expedition/status", requireAuth, async (req, res) => {
     const u = r.rows[0] || {};
     return res.json({
       ok: true,
+      server_ts: now.toISOString(),
       expedition_active: !!u.expedition_active,
       expedition_started_at: u.expedition_started_at,
       expedition_ends_at: u.expedition_ends_at,
@@ -1204,7 +1205,7 @@ app.post("/api/expedition/start", requireAuth, async (req, res) => {
       );
 
       await query("COMMIT");
-      return res.json({ ok: true, expedition_active: true, expedition_started_at: now.toISOString(), expedition_ends_at: endsAt.toISOString(), expedition_planet: planet });
+      return res.json({ ok: true, server_ts: now.toISOString(), expedition_active: true, expedition_started_at: now.toISOString(), expedition_ends_at: endsAt.toISOString(), expedition_planet: planet });
     } catch (e) {
       await query("ROLLBACK").catch(() => {});
       throw e;
