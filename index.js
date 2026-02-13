@@ -428,6 +428,16 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
     // Settle expeditions that may have expired while user was offline
     await settleExpiredExpedition(wallet, now);
 
+    // IMPORTANT: settleExpiredExpedition can UPDATE pending_earnings / last_accrual_at / expedition flags.
+    // Reload user so the response reflects the latest authoritative state.
+    userResult = await query(
+      `SELECT wallet, last_claim_at, last_accrual_at, expedition_active, expedition_started_at, expedition_ends_at, expedition_planet, total_claimed_points, pending_earnings
+       FROM users
+       WHERE wallet = $1`,
+      [wallet]
+    );
+    user = userResult.rows[0] || user;
+
     const totalRoiPerDay = await calculateCurrentROI(wallet);
 
     const accrualBase = user.last_accrual_at || user.last_claim_at;
