@@ -193,6 +193,15 @@ async function initDb() {
       END$$;
     `);
   }
+  // 1f) auth nonces (persisted to support multi-instance deployments)
+  await query(`
+    CREATE TABLE IF NOT EXISTS auth_nonces (
+      wallet TEXT PRIMARY KEY,
+      nonce TEXT NOT NULL,
+      expires_at TIMESTAMP NOT NULL
+    );
+  `);
+
   // 2) aliens owned by users
   await query(`
     CREATE TABLE IF NOT EXISTS aliens (

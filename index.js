@@ -94,24 +94,56 @@ if (!JWT_SECRET) {
   }
 }
 
-// short-lived nonce store (in-memory). For multi-instance, move to Redis.
+// short-lived nonce store.
+// IMPORTANT: Railway can run multiple instances; in-memory nonces will randomly fail.
+// We keep an in-memory cache, but the source of truth is the DB table `auth_nonces`.
 const nonces = new Map();
 const NONCE_TTL_MS = 5 * 60 * 1000;
 
-function createNonce(wallet) {
+async function createNonce(wallet) {
   const nonce = nanoid(32);
-  nonces.set(wallet, { nonce, exp: Date.now() + NONCE_TTL_MS });
+  const expAt = new Date(Date.now() + NONCE_TTL_MS);
+
+  // cache (best-effort)
+  nonces.set(wallet, { nonce, exp: expAt.getTime() });
+
+  // persist (authoritative)
+  await query(
+    `INSERT INTO auth_nonces (wallet, nonce, expires_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (wallet)
+     DO UPDATE SET nonce = EXCLUDED.nonce, expires_at = EXCLUDED.expires_at`,
+    [wallet, nonce, expAt]
+  );
+
   return nonce;
 }
 
-function getNonce(wallet) {
-  const entry = nonces.get(wallet);
-  if (!entry) return null;
-  if (Date.now() > entry.exp) {
+async function getNonce(wallet) {
+  const cached = nonces.get(wallet);
+  if (cached) {
+    if (Date.now() <= cached.exp) return cached.nonce;
     nonces.delete(wallet);
+  }
+
+  const r = await query(
+    `SELECT nonce, expires_at
+     FROM auth_nonces
+     WHERE wallet=$1`,
+    [wallet]
+  );
+
+  if (r.rowCount === 0) return null;
+
+  const { nonce, expires_at } = r.rows[0];
+  if (!expires_at || Date.now() > new Date(expires_at).getTime()) {
+    await query(`DELETE FROM auth_nonces WHERE wallet=$1`, [wallet]);
     return null;
   }
-  return entry.nonce;
+
+  // refresh cache
+  nonces.set(wallet, { nonce, exp: new Date(expires_at).getTime() });
+  return nonce;
 }
 
 function requireAuth(req, res, next) {
@@ -778,18 +810,23 @@ app.get("/api/price/sol-usd", async (_req, res) => {
 });
 
 // Get a nonce to sign for login
-app.post("/api/auth/nonce", (req, res) => {
-  const { wallet } = req.body || {};
-  if (!wallet || !isProbableSolanaAddress(wallet)) {
-    return res.status(400).json({ error: "Invalid wallet" });
+app.post("/api/auth/nonce", async (req, res) => {
+  try {
+    const { wallet } = req.body || {};
+    if (!wallet || !isProbableSolanaAddress(wallet)) {
+      return res.status(400).json({ error: "Invalid wallet" });
+    }
+    const nonce = await createNonce(wallet);
+    const message = `Zeruva login\nWallet: ${wallet}\nNonce: ${nonce}`;
+    return res.json({ wallet, nonce, message, ttl_ms: NONCE_TTL_MS });
+  } catch (e) {
+    console.error("POST /api/auth/nonce error", e);
+    return res.status(500).json({ error: "Failed to create nonce" });
   }
-  const nonce = createNonce(wallet);
-  const message = `Zeruva login\nWallet: ${wallet}\nNonce: ${nonce}`;
-  res.json({ wallet, nonce, message, ttl_ms: NONCE_TTL_MS });
 });
 
 // Verify signature and issue JWT
-app.post("/api/auth/verify", (req, res) => {
+app.post("/api/auth/verify", async (req, res) => {
   if (!JWT_SECRET) return res.status(500).json({ error: "Server misconfigured (JWT_SECRET missing)" });
 
   const { wallet, signature, nonce } = req.body || {};
@@ -800,7 +837,7 @@ app.post("/api/auth/verify", (req, res) => {
     return res.status(400).json({ error: "Invalid wallet" });
   }
 
-  const expected = getNonce(wallet);
+  const expected = await getNonce(wallet);
   if (!expected || expected !== nonce) {
     return res.status(400).json({ error: "Invalid/expired nonce" });
   }
@@ -820,6 +857,7 @@ app.post("/api/auth/verify", (req, res) => {
 
     // Consume nonce (one-time)
     nonces.delete(wallet);
+    await query(`DELETE FROM auth_nonces WHERE wallet=$1`, [wallet]);
 
     const token = jwt.sign({ wallet }, JWT_SECRET, { expiresIn: "12h" });
     return res.json({ token, wallet, expires_in: "12h" });
