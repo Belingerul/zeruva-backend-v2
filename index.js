@@ -376,9 +376,10 @@ async function calculateAssignedROI(wallet) {
 
 async function settleExpiredExpedition(wallet, now) {
   // If an expedition expired while the user was offline, settle earnings up to ends_at,
-  // then turn expedition off. This preserves the 24h claim timer (last_claim_at).
+  // then turn expedition off. Also grant loot once per expedition.
   const uRes = await query(
-    `SELECT expedition_active, expedition_ends_at, last_accrual_at, last_claim_at, pending_earnings
+    `SELECT expedition_active, expedition_ends_at, expedition_planet, expedition_rewarded_at,
+            last_accrual_at, last_claim_at, pending_earnings
      FROM users WHERE wallet=$1`,
     [wallet]
   );
@@ -389,9 +390,25 @@ async function settleExpiredExpedition(wallet, now) {
   const endsAt = new Date(u.expedition_ends_at);
   if (now.getTime() <= endsAt.getTime()) return;
 
+  const planetKey = u.expedition_planet || "planet-1";
+
   const roi = await calculateAssignedROI(wallet);
   const accrualBase = u.last_accrual_at || u.last_claim_at;
   const earned = calculateUnclaimedEarnings(accrualBase, roi, endsAt);
+
+  // Loot: ensure we only grant once per expedition end timestamp.
+  const alreadyRewarded = u.expedition_rewarded_at && new Date(u.expedition_rewarded_at).getTime() >= endsAt.getTime();
+  if (!alreadyRewarded) {
+    const drops = rollLoot(planetKey);
+    for (const d of drops) {
+      await query(
+        `INSERT INTO expedition_loot (wallet, expedition_ends_at, planet, item_key, qty)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [wallet, endsAt, planetKey, d.item_key, d.qty]
+      );
+      await addItem(wallet, d.item_key, d.qty);
+    }
+  }
 
   await query(
     `UPDATE users
@@ -400,9 +417,10 @@ async function settleExpiredExpedition(wallet, now) {
          expedition_ends_at = NULL,
          expedition_started_at = NULL,
          expedition_planet = NULL,
+         expedition_rewarded_at = $4,
          last_accrual_at = $2
      WHERE wallet=$3`,
-    [earned, endsAt, wallet]
+    [earned, endsAt, wallet, endsAt]
   );
 }
 
@@ -420,8 +438,80 @@ async function calculateCurrentROI(wallet) {
   if (!active) return 0;
   if (endsAt && Date.now() > endsAt.getTime()) return 0;
 
-  return await calculateAssignedROI(wallet);
+  const planetKey = u?.expedition_planet || "planet-1";
+  const mult = getPlanet(planetKey)?.roiMult || 1.0;
+  const base = await calculateAssignedROI(wallet);
+  return base * mult;
 }
+
+app.get("/api/planets", (_req, res) => {
+  res.json({ ok: true, planets: PLANETS });
+});
+
+app.get("/api/inventory", requireAuth, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const r = await query(
+      `SELECT item_key, qty FROM user_items WHERE wallet=$1 ORDER BY item_key`,
+      [wallet]
+    );
+    res.json({ ok: true, items: r.rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/ship/upgrade-with-items", requireAuth, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const now = new Date();
+
+    const userRes = await query(`SELECT ship_level FROM users WHERE wallet=$1`, [wallet]);
+    const level = Number(userRes.rows[0]?.ship_level || 1);
+    const nextLevel = level + 1;
+
+    // Simple cost curve (can be tuned): level2=3 common, level3=5 common+1 rare, level4=8 common+2 rare+1 epic...
+    const cost = {
+      mat_common: 3 + (nextLevel - 2) * 2,
+      mat_rare: nextLevel >= 3 ? Math.max(0, nextLevel - 2) : 0,
+      mat_epic: nextLevel >= 5 ? 1 : 0,
+    };
+
+    // Check balances
+    const balRes = await query(`SELECT item_key, qty FROM user_items WHERE wallet=$1`, [wallet]);
+    const bal = Object.fromEntries(balRes.rows.map((r) => [r.item_key, Number(r.qty)]));
+
+    for (const [k, need] of Object.entries(cost)) {
+      if (need <= 0) continue;
+      if ((bal[k] || 0) < need) {
+        return res.status(400).json({ error: `Not enough ${k}` , cost, balance: bal });
+      }
+    }
+
+    await query("BEGIN");
+    try {
+      // Deduct
+      for (const [k, need] of Object.entries(cost)) {
+        if (need <= 0) continue;
+        await query(
+          `UPDATE user_items SET qty = qty - $3, updated_at=$2 WHERE wallet=$1 AND item_key=$4`,
+          [wallet, now, need, k]
+        );
+      }
+      // Upgrade
+      await query(`UPDATE users SET ship_level = ship_level + 1 WHERE wallet=$1`, [wallet]);
+      await query("COMMIT");
+    } catch (e) {
+      await query("ROLLBACK");
+      throw e;
+    }
+
+    return res.json({ ok: true, upgraded: true, level: nextLevel, cost });
+  } catch (e) {
+    console.error("POST /api/ship/upgrade-with-items error", e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
   try {
@@ -1158,6 +1248,36 @@ app.post("/api/register", requireAuth, async (req, res) => {
 // ===== Expeditions =====
 const EXPEDITION_DURATION_MS = 6 * 60 * 60 * 1000;
 
+const PLANETS = [
+  { key: "planet-1", name: "Astra", roiMult: 1.0, loot: { mat_common: 1.0, mat_rare: 0.15, mat_epic: 0.03 } },
+  { key: "planet-2", name: "Vulcan", roiMult: 1.25, loot: { mat_common: 1.0, mat_rare: 0.22, mat_epic: 0.05 } },
+  { key: "planet-3", name: "Nyx", roiMult: 1.5, loot: { mat_common: 1.0, mat_rare: 0.30, mat_epic: 0.08 } },
+];
+
+function getPlanet(planetKey) {
+  return PLANETS.find((p) => p.key === planetKey) || PLANETS[0];
+}
+
+async function addItem(wallet, itemKey, qty) {
+  if (!qty || qty <= 0) return;
+  await query(
+    `INSERT INTO user_items (wallet, item_key, qty)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (wallet, item_key)
+     DO UPDATE SET qty = user_items.qty + EXCLUDED.qty, updated_at = NOW()` ,
+    [wallet, itemKey, qty]
+  );
+}
+
+function rollLoot(planetKey) {
+  const p = getPlanet(planetKey);
+  // Always give 1 common mat; then roll rare/epic.
+  const drops = [{ item_key: "mat_common", qty: 1 }];
+  if (Math.random() < (p.loot?.mat_rare || 0)) drops.push({ item_key: "mat_rare", qty: 1 });
+  if (Math.random() < (p.loot?.mat_epic || 0)) drops.push({ item_key: "mat_epic", qty: 1 });
+  return drops;
+}
+
 app.get("/api/expedition/status", requireAuth, async (req, res) => {
   try {
     const wallet = req.auth?.wallet;
@@ -1192,7 +1312,8 @@ app.post("/api/expedition/start", requireAuth, async (req, res) => {
     const wallet = req.auth?.wallet;
     if (!wallet) return res.status(401).json({ error: "Unauthorized" });
 
-    const planet = String(req.body?.planet || "planet-1");
+    const requestedPlanet = String(req.body?.planet || "planet-1");
+    const planet = getPlanet(requestedPlanet)?.key || "planet-1";
     const now = new Date();
 
     await query("BEGIN");

@@ -54,6 +54,7 @@ async function initDb() {
         expedition_started_at TIMESTAMP,
         expedition_ends_at TIMESTAMP,
         expedition_planet TEXT,
+        expedition_rewarded_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW(),
         last_claim_at TIMESTAMP DEFAULT NOW(),
         last_accrual_at TIMESTAMP DEFAULT NOW(),
@@ -66,6 +67,7 @@ async function initDb() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS expedition_started_at TIMESTAMP;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS expedition_ends_at TIMESTAMP;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS expedition_planet TEXT;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS expedition_rewarded_at TIMESTAMP;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS eggs_basic INTEGER DEFAULT 0;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS eggs_rare INTEGER DEFAULT 0;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS eggs_ultra INTEGER DEFAULT 0;
@@ -114,6 +116,14 @@ async function initDb() {
         ) THEN
           ALTER TABLE users
           ADD COLUMN expedition_planet TEXT;
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'users' AND column_name = 'expedition_rewarded_at'
+        ) THEN
+          ALTER TABLE users
+          ADD COLUMN expedition_rewarded_at TIMESTAMP;
         END IF;
       END$$;
     `);
@@ -199,6 +209,30 @@ async function initDb() {
       wallet TEXT PRIMARY KEY,
       nonce TEXT NOT NULL,
       expires_at TIMESTAMP NOT NULL
+    );
+  `);
+
+  // 1g) expedition loot (drops granted when an expedition ends)
+  await query(`
+    CREATE TABLE IF NOT EXISTS expedition_loot (
+      id SERIAL PRIMARY KEY,
+      wallet TEXT NOT NULL,
+      expedition_ends_at TIMESTAMP NOT NULL,
+      planet TEXT,
+      item_key TEXT NOT NULL,
+      qty INTEGER NOT NULL DEFAULT 1,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // 1h) simple user inventory (materials/items)
+  await query(`
+    CREATE TABLE IF NOT EXISTS user_items (
+      wallet TEXT NOT NULL,
+      item_key TEXT NOT NULL,
+      qty INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (wallet, item_key)
     );
   `);
 
