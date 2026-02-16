@@ -39,6 +39,35 @@ app.use(
   })
 );
 
+// Targeted rate limits for sensitive routes
+const authNonceLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const authVerifyLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const expeditionStartLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const upgradeWithItemsLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // CORS: use explicit allow-list (no wildcard strings).
 // Set FRONTEND_ORIGINS as comma-separated list (e.g. "https://app.example.com,https://staging.example.com")
 const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
@@ -461,7 +490,7 @@ app.get("/api/inventory", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/ship/upgrade-with-items", requireAuth, async (req, res) => {
+app.post("/api/ship/upgrade-with-items", upgradeWithItemsLimiter, requireAuth, async (req, res) => {
   try {
     const wallet = req.auth?.wallet;
     const now = new Date();
@@ -900,7 +929,7 @@ app.get("/api/price/sol-usd", async (_req, res) => {
 });
 
 // Get a nonce to sign for login
-app.post("/api/auth/nonce", async (req, res) => {
+app.post("/api/auth/nonce", authNonceLimiter, async (req, res) => {
   try {
     const { wallet } = req.body || {};
     if (!wallet || !isProbableSolanaAddress(wallet)) {
@@ -916,7 +945,7 @@ app.post("/api/auth/nonce", async (req, res) => {
 });
 
 // Verify signature and issue JWT
-app.post("/api/auth/verify", async (req, res) => {
+app.post("/api/auth/verify", authVerifyLimiter, async (req, res) => {
   if (!JWT_SECRET) return res.status(500).json({ error: "Server misconfigured (JWT_SECRET missing)" });
 
   const { wallet, signature, nonce } = req.body || {};
@@ -1307,7 +1336,7 @@ app.get("/api/expedition/status", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/expedition/start", requireAuth, async (req, res) => {
+app.post("/api/expedition/start", expeditionStartLimiter, requireAuth, async (req, res) => {
   try {
     const wallet = req.auth?.wallet;
     if (!wallet) return res.status(401).json({ error: "Unauthorized" });
