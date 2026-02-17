@@ -212,30 +212,6 @@ async function initDb() {
     );
   `);
 
-  // 1g) expedition loot (drops granted when an expedition ends)
-  await query(`
-    CREATE TABLE IF NOT EXISTS expedition_loot (
-      id SERIAL PRIMARY KEY,
-      wallet TEXT NOT NULL,
-      expedition_ends_at TIMESTAMP NOT NULL,
-      planet TEXT,
-      item_key TEXT NOT NULL,
-      qty INTEGER NOT NULL DEFAULT 1,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // 1h) simple user inventory (materials/items)
-  await query(`
-    CREATE TABLE IF NOT EXISTS user_items (
-      wallet TEXT NOT NULL,
-      item_key TEXT NOT NULL,
-      qty INTEGER NOT NULL DEFAULT 0,
-      updated_at TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY (wallet, item_key)
-    );
-  `);
-
   // 2) aliens owned by users
   await query(`
     CREATE TABLE IF NOT EXISTS aliens (
