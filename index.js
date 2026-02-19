@@ -68,6 +68,13 @@ const upgradeWithItemsLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const geEnterLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // CORS: use explicit allow-list (no wildcard strings).
 // Set FRONTEND_ORIGINS as comma-separated list (e.g. "https://app.example.com,https://staging.example.com")
 const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
@@ -1704,7 +1711,7 @@ function requireAdmin(req, res, next) {
 
 async function getCurrentRound() {
   const r = await query(
-    `SELECT * FROM ge_rounds WHERE status='open' ORDER BY id DESC LIMIT 1`
+    `SELECT * FROM ge_rounds WHERE status IN ('filling','running') ORDER BY id DESC LIMIT 1`
   );
   return r.rows[0] || null;
 }
@@ -1727,8 +1734,19 @@ async function getRoundStats(roundId) {
 }
 
 app.get("/api/v2/ge/round/current", async (_req, res) => {
-  const round = await getCurrentRound();
-  if (!round) return res.json({ ok: true, round: null });
+  // Ensure a current round exists
+  let round = await getCurrentRound();
+  if (!round) {
+    const farFuture = new Date(Date.now() + 1000 * 60 * 60 * 24 * 365 * 50);
+    const r = await query(
+      `INSERT INTO ge_rounds (status, ends_at, ships_count, emissions_total, started_at)
+       VALUES ('filling', $1, $2, 0, NULL)
+       RETURNING *`,
+      [farFuture, GE_SHIPS]
+    );
+    round = r.rows[0];
+  }
+
   const stats = await getRoundStats(round.id);
   return res.json({
     ok: true,
@@ -1741,9 +1759,16 @@ app.get("/api/v2/ge/round/current", async (_req, res) => {
       ships_count: round.ships_count,
       emissions_total: Number(round.emissions_total || 0),
       winning_ship_index: round.winning_ship_index ?? null,
+      // seed is only meaningful after settle; still included for audit
       seed: round.seed ?? null,
     },
     stats,
+    config: {
+      ships: GE_SHIPS,
+      round_minutes: Number(process.env.GE_ROUND_MINUTES || 10),
+      dev_bps: Number(process.env.GE_DEV_BPS || 200),
+      treasury_bps: Number(process.env.GE_TREASURY_BPS || 600),
+    },
   });
 });
 
@@ -1764,7 +1789,7 @@ app.get("/api/v2/ge/me", requireAuth, async (req, res) => {
   return res.json({ ok: true, round_id: round.id, my: mine.rows.map(r => ({ ship_index: Number(r.ship_index), qty: Number(r.qty) })) });
 });
 
-app.post("/api/v2/ge/enter", requireAuth, async (req, res) => {
+app.post("/api/v2/ge/enter", geEnterLimiter, requireAuth, async (req, res) => {
   try {
     const wallet = req.auth?.wallet;
     const round = await getCurrentRound();
@@ -1803,6 +1828,13 @@ app.post("/api/v2/ge/enter", requireAuth, async (req, res) => {
           [round.id, endsAt]
         );
       }
+    }
+
+    // Enforce state: once running ends, no more entries.
+    // (We keep it strict to prevent last-millisecond sniping.)
+    const updated = await getCurrentRound();
+    if (updated?.id === round.id && updated.started_at && Date.now() > new Date(updated.ends_at).getTime()) {
+      return res.status(400).json({ error: "Round already ended" });
     }
 
     return res.json({ ok: true, round_id: round.id, stats });
