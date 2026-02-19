@@ -1726,7 +1726,7 @@ async function getRoundStats(roundId) {
   return { perShip, totalEntries };
 }
 
-app.get("/api/v2/ge/round/current", requireAuth, async (req, res) => {
+app.get("/api/v2/ge/round/current", async (_req, res) => {
   const round = await getCurrentRound();
   if (!round) return res.json({ ok: true, round: null });
   const stats = await getRoundStats(round.id);
@@ -1736,9 +1736,12 @@ app.get("/api/v2/ge/round/current", requireAuth, async (req, res) => {
       id: round.id,
       status: round.status,
       starts_at: round.starts_at,
+      started_at: round.started_at,
       ends_at: round.ends_at,
       ships_count: round.ships_count,
       emissions_total: Number(round.emissions_total || 0),
+      winning_ship_index: round.winning_ship_index ?? null,
+      seed: round.seed ?? null,
     },
     stats,
   });
@@ -1859,8 +1862,15 @@ app.post("/api/v2/ge/admin/settle", requireAdmin, async (req, res) => {
     const n = parseInt(seed.slice(0, 8), 16);
     const winningShip = n % GE_SHIPS;
 
-    // Prize pool (MVP): emissions_total increases by 1 per entry, winner takes all.
-    const emissionsTotal = Number(stats.totalEntries);
+    // Prize pool (MVP): emissions_total increases by 1 per entry.
+    // Split: dev + treasury + winners.
+    const pot = Number(stats.totalEntries);
+    const DEV_BPS = Number(process.env.GE_DEV_BPS || 200); // 2.00%
+    const TREASURY_BPS = Number(process.env.GE_TREASURY_BPS || 600); // 6.00%
+    const devCut = (pot * DEV_BPS) / 10000;
+    const treasuryCut = (pot * TREASURY_BPS) / 10000;
+    const emissionsTotal = pot;
+    const winnersPot = Math.max(0, pot - devCut - treasuryCut);
 
     // Winners are wallets that picked winningShip; split pro-rata by qty.
     const winners = await query(
@@ -1886,7 +1896,7 @@ app.post("/api/v2/ge/admin/settle", requireAdmin, async (req, res) => {
       for (const w of winners.rows) {
         const q = Number(w.qty);
         if (q <= 0 || winTotalQty <= 0) continue;
-        const amount = (emissionsTotal * q) / winTotalQty;
+        const amount = (winnersPot * q) / winTotalQty;
         await query(
           `INSERT INTO ge_payouts (round_id, wallet, amount) VALUES ($1,$2,$3)`,
           [round.id, w.wallet, amount]
@@ -1906,7 +1916,7 @@ app.post("/api/v2/ge/admin/settle", requireAdmin, async (req, res) => {
       throw e;
     }
 
-    return res.json({ ok: true, round_id: round.id, winning_ship_index: winningShip, seed, emissions_total: emissionsTotal });
+    return res.json({ ok: true, round_id: round.id, winning_ship_index: winningShip, seed, emissions_total: emissionsTotal, pot, winners_pot: winnersPot, dev_cut: devCut, treasury_cut: treasuryCut });
   } catch (e) {
     console.error("POST /api/v2/ge/admin/settle error", e);
     return res.status(500).json({ error: e.message });
