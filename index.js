@@ -1691,6 +1691,204 @@ app.post("/api/confirm-buy-spaceship", requireAuth, async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
+// ===== Great Expedition (v2) API =====
+const GE_SHIPS = 25;
+const GE_ADMIN_KEY = process.env.GE_ADMIN_KEY || "";
+
+function requireAdmin(req, res, next) {
+  if (!GE_ADMIN_KEY) return res.status(500).json({ error: "Server misconfigured (GE_ADMIN_KEY missing)" });
+  const k = req.headers["x-admin-key"];
+  if (k !== GE_ADMIN_KEY) return res.status(403).json({ error: "Forbidden" });
+  return next();
+}
+
+async function getCurrentRound() {
+  const r = await query(
+    `SELECT * FROM ge_rounds WHERE status='open' ORDER BY id DESC LIMIT 1`
+  );
+  return r.rows[0] || null;
+}
+
+async function getRoundStats(roundId) {
+  const totals = await query(
+    `SELECT ship_index, COALESCE(SUM(qty),0) AS qty
+     FROM ge_entries WHERE round_id=$1
+     GROUP BY ship_index
+     ORDER BY ship_index`,
+    [roundId]
+  );
+  const perShip = Array.from({ length: GE_SHIPS }).map((_, i) => ({ ship_index: i, qty: 0 }));
+  for (const row of totals.rows) {
+    const idx = Number(row.ship_index);
+    if (idx >= 0 && idx < GE_SHIPS) perShip[idx].qty = Number(row.qty);
+  }
+  const totalEntries = perShip.reduce((a, b) => a + b.qty, 0);
+  return { perShip, totalEntries };
+}
+
+app.get("/api/v2/ge/round/current", requireAuth, async (req, res) => {
+  const round = await getCurrentRound();
+  if (!round) return res.json({ ok: true, round: null });
+  const stats = await getRoundStats(round.id);
+  return res.json({
+    ok: true,
+    round: {
+      id: round.id,
+      status: round.status,
+      starts_at: round.starts_at,
+      ends_at: round.ends_at,
+      ships_count: round.ships_count,
+      emissions_total: Number(round.emissions_total || 0),
+    },
+    stats,
+  });
+});
+
+app.get("/api/v2/ge/me", requireAuth, async (req, res) => {
+  const wallet = req.auth?.wallet;
+  const round = await getCurrentRound();
+  if (!round) return res.json({ ok: true, round: null, my: null });
+
+  const mine = await query(
+    `SELECT ship_index, COALESCE(SUM(qty),0) AS qty
+     FROM ge_entries
+     WHERE round_id=$1 AND wallet=$2
+     GROUP BY ship_index
+     ORDER BY ship_index`,
+    [round.id, wallet]
+  );
+
+  return res.json({ ok: true, round_id: round.id, my: mine.rows.map(r => ({ ship_index: Number(r.ship_index), qty: Number(r.qty) })) });
+});
+
+app.post("/api/v2/ge/enter", requireAuth, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const round = await getCurrentRound();
+    if (!round) return res.status(400).json({ error: "No open round" });
+
+    const now = new Date();
+    if (now.getTime() > new Date(round.ends_at).getTime()) {
+      return res.status(400).json({ error: "Round already ended" });
+    }
+
+    const shipIndex = Number(req.body?.ship_index);
+    const qty = Math.max(1, Math.min(100, Number(req.body?.qty || 1)));
+    if (!Number.isInteger(shipIndex) || shipIndex < 0 || shipIndex >= GE_SHIPS) {
+      return res.status(400).json({ error: "Invalid ship_index" });
+    }
+
+    // MVP: free entries. Later: require buying credits / on-chain.
+    await query(
+      `INSERT INTO ge_entries (round_id, wallet, ship_index, qty)
+       VALUES ($1,$2,$3,$4)`,
+      [round.id, wallet, shipIndex, qty]
+    );
+
+    const stats = await getRoundStats(round.id);
+    return res.json({ ok: true, round_id: round.id, stats });
+  } catch (e) {
+    console.error("POST /api/v2/ge/enter error", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/v2/ge/admin/create-round", requireAdmin, async (req, res) => {
+  try {
+    const durationMinutes = Math.max(5, Math.min(24*60, Number(req.body?.duration_minutes || 60)));
+    const endsAt = new Date(Date.now() + durationMinutes * 60 * 1000);
+
+    // Close any existing open round
+    await query(`UPDATE ge_rounds SET status='closed' WHERE status='open'`);
+
+    const r = await query(
+      `INSERT INTO ge_rounds (status, ends_at, ships_count, emissions_total)
+       VALUES ('open', $1, $2, 0)
+       RETURNING *`,
+      [endsAt, GE_SHIPS]
+    );
+
+    return res.json({ ok: true, round: r.rows[0] });
+  } catch (e) {
+    console.error("POST /api/v2/ge/admin/create-round error", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/v2/ge/admin/settle", requireAdmin, async (req, res) => {
+  try {
+    const round = await getCurrentRound();
+    if (!round) return res.status(400).json({ error: "No open round" });
+
+    const now = new Date();
+    const endsAt = new Date(round.ends_at);
+    if (now.getTime() < endsAt.getTime()) {
+      return res.status(400).json({ error: "Round not ended yet" });
+    }
+
+    const stats = await getRoundStats(round.id);
+    const seed = crypto.createHash("sha256")
+      .update(`${round.id}:${endsAt.toISOString()}:${stats.totalEntries}:${GE_ADMIN_KEY}`)
+      .digest("hex");
+
+    // Pick winning ship: equal chance per ship (0..24)
+    const n = parseInt(seed.slice(0, 8), 16);
+    const winningShip = n % GE_SHIPS;
+
+    // Prize pool (MVP): emissions_total increases by 1 per entry, winner takes all.
+    const emissionsTotal = Number(stats.totalEntries);
+
+    // Winners are wallets that picked winningShip; split pro-rata by qty.
+    const winners = await query(
+      `SELECT wallet, COALESCE(SUM(qty),0) AS qty
+       FROM ge_entries
+       WHERE round_id=$1 AND ship_index=$2
+       GROUP BY wallet`,
+      [round.id, winningShip]
+    );
+
+    const winTotalQty = winners.rows.reduce((a, r) => a + Number(r.qty), 0);
+
+    await query("BEGIN");
+    try {
+      await query(
+        `UPDATE ge_rounds
+         SET status='settled', settled_at=NOW(), winning_ship_index=$2, emissions_total=$3, seed=$4
+         WHERE id=$1`,
+        [round.id, winningShip, emissionsTotal, seed]
+      );
+
+      // record payouts in ge_balances
+      for (const w of winners.rows) {
+        const q = Number(w.qty);
+        if (q <= 0 || winTotalQty <= 0) continue;
+        const amount = (emissionsTotal * q) / winTotalQty;
+        await query(
+          `INSERT INTO ge_payouts (round_id, wallet, amount) VALUES ($1,$2,$3)`,
+          [round.id, w.wallet, amount]
+        );
+        await query(
+          `INSERT INTO ge_balances (wallet, balance) VALUES ($1,$2)
+           ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + EXCLUDED.balance, updated_at=NOW()`,
+          [w.wallet, amount]
+        );
+      }
+
+      // close round
+      await query(`UPDATE ge_rounds SET status='closed' WHERE id=$1 AND status='open'`, [round.id]);
+      await query("COMMIT");
+    } catch (e) {
+      await query("ROLLBACK");
+      throw e;
+    }
+
+    return res.json({ ok: true, round_id: round.id, winning_ship_index: winningShip, seed, emissions_total: emissionsTotal });
+  } catch (e) {
+    console.error("POST /api/v2/ge/admin/settle error", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 initDb()
   .then(() => {
     app.listen(PORT, () => console.log(`✅ Zeruva API running on ${PORT}`));

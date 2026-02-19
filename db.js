@@ -212,6 +212,47 @@ async function initDb() {
     );
   `);
 
+  // ===== Great Expedition (v2) =====
+  await query(`
+    CREATE TABLE IF NOT EXISTS ge_rounds (
+      id SERIAL PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'open',
+      starts_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      ends_at TIMESTAMP NOT NULL,
+      ships_count INTEGER NOT NULL DEFAULT 25,
+      emissions_total NUMERIC(30, 10) NOT NULL DEFAULT 0,
+      winning_ship_index INTEGER,
+      settled_at TIMESTAMP,
+      seed TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS ge_entries (
+      id SERIAL PRIMARY KEY,
+      round_id INTEGER NOT NULL REFERENCES ge_rounds(id) ON DELETE CASCADE,
+      wallet TEXT NOT NULL,
+      ship_index INTEGER NOT NULL,
+      qty INTEGER NOT NULL DEFAULT 1,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS ge_entries_round_wallet_idx ON ge_entries(round_id, wallet);
+    CREATE INDEX IF NOT EXISTS ge_entries_round_ship_idx ON ge_entries(round_id, ship_index);
+
+    CREATE TABLE IF NOT EXISTS ge_payouts (
+      id SERIAL PRIMARY KEY,
+      round_id INTEGER NOT NULL REFERENCES ge_rounds(id) ON DELETE CASCADE,
+      wallet TEXT NOT NULL,
+      amount NUMERIC(30, 10) NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS ge_balances (
+      wallet TEXT PRIMARY KEY,
+      balance NUMERIC(30, 10) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
   // 2) aliens owned by users
   await query(`
     CREATE TABLE IF NOT EXISTS aliens (
