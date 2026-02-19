@@ -1869,89 +1869,159 @@ app.post("/api/v2/ge/admin/create-round", requireAdmin, async (req, res) => {
   }
 });
 
+async function settleRound(round) {
+  const now = new Date();
+
+  if (!round.started_at || round.status !== "running") {
+    return { ok: false, error: "Round not running" };
+  }
+
+  const endsAt = new Date(round.ends_at);
+  if (now.getTime() < endsAt.getTime()) {
+    return { ok: false, error: "Round not ended yet" };
+  }
+
+  const stats = await getRoundStats(round.id);
+  const seed = crypto
+    .createHash("sha256")
+    .update(`${round.id}:${endsAt.toISOString()}:${stats.totalEntries}:${GE_ADMIN_KEY || "no-admin-key"}`)
+    .digest("hex");
+
+  // Pick winning ship: equal chance per ship (0..24)
+  const n = parseInt(seed.slice(0, 8), 16);
+  const winningShip = n % GE_SHIPS;
+
+  const pot = Number(stats.totalEntries);
+  const DEV_BPS = Number(process.env.GE_DEV_BPS || 200);
+  const TREASURY_BPS = Number(process.env.GE_TREASURY_BPS || 600);
+  const devCut = (pot * DEV_BPS) / 10000;
+  const treasuryCut = (pot * TREASURY_BPS) / 10000;
+  const emissionsTotal = pot;
+  const winnersPot = Math.max(0, pot - devCut - treasuryCut);
+
+  // Winners are wallets that picked winningShip; split pro-rata by qty.
+  const winners = await query(
+    `SELECT wallet, COALESCE(SUM(qty),0) AS qty
+     FROM ge_entries
+     WHERE round_id=$1 AND ship_index=$2
+     GROUP BY wallet`,
+    [round.id, winningShip]
+  );
+
+  const winTotalQty = winners.rows.reduce((a, r) => a + Number(r.qty), 0);
+
+  await query("BEGIN");
+  try {
+    // Idempotency: only the first settler succeeds.
+    const upd = await query(
+      `UPDATE ge_rounds
+       SET status='settled', settled_at=NOW(), winning_ship_index=$2, emissions_total=$3, seed=$4
+       WHERE id=$1 AND status='running'
+       RETURNING id`,
+      [round.id, winningShip, emissionsTotal, seed]
+    );
+
+    if (upd.rowCount === 0) {
+      await query("ROLLBACK");
+      return { ok: true, already_settled: true, round_id: round.id };
+    }
+
+    // dev + treasury balances
+    if (devCut > 0) {
+      await query(
+        `INSERT INTO ge_balances (wallet, balance) VALUES ('__dev__', $1)
+         ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + EXCLUDED.balance, updated_at=NOW()`,
+        [devCut]
+      );
+    }
+    if (treasuryCut > 0) {
+      await query(
+        `INSERT INTO ge_balances (wallet, balance) VALUES ('__treasury__', $1)
+         ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + EXCLUDED.balance, updated_at=NOW()`,
+        [treasuryCut]
+      );
+    }
+
+    // record payouts in ge_balances
+    for (const w of winners.rows) {
+      const q = Number(w.qty);
+      if (q <= 0 || winTotalQty <= 0) continue;
+      const amount = (winnersPot * q) / winTotalQty;
+      await query(
+        `INSERT INTO ge_payouts (round_id, wallet, amount) VALUES ($1,$2,$3)`,
+        [round.id, w.wallet, amount]
+      );
+      await query(
+        `INSERT INTO ge_balances (wallet, balance) VALUES ($1,$2)
+         ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + EXCLUDED.balance, updated_at=NOW()`,
+        [w.wallet, amount]
+      );
+    }
+
+    await query("COMMIT");
+  } catch (e) {
+    await query("ROLLBACK");
+    throw e;
+  }
+
+  return {
+    ok: true,
+    round_id: round.id,
+    winning_ship_index: winningShip,
+    seed,
+    emissions_total: emissionsTotal,
+    pot,
+    winners_pot: winnersPot,
+    dev_cut: devCut,
+    treasury_cut: treasuryCut,
+  };
+}
+
 app.post("/api/v2/ge/admin/settle", requireAdmin, async (req, res) => {
   try {
     const round = await getCurrentRound();
-    if (!round) return res.status(400).json({ error: "No open round" });
-
-    const now = new Date();
-
-    if (!round.started_at || round.status !== 'running') {
-      return res.status(400).json({ error: "Round not running" });
-    }
-
-    const endsAt = new Date(round.ends_at);
-    if (now.getTime() < endsAt.getTime()) {
-      return res.status(400).json({ error: "Round not ended yet" });
-    }
-
-    const stats = await getRoundStats(round.id);
-    const seed = crypto.createHash("sha256")
-      .update(`${round.id}:${endsAt.toISOString()}:${stats.totalEntries}:${GE_ADMIN_KEY}`)
-      .digest("hex");
-
-    // Pick winning ship: equal chance per ship (0..24)
-    const n = parseInt(seed.slice(0, 8), 16);
-    const winningShip = n % GE_SHIPS;
-
-    // Prize pool (MVP): emissions_total increases by 1 per entry.
-    // Split: dev + treasury + winners.
-    const pot = Number(stats.totalEntries);
-    const DEV_BPS = Number(process.env.GE_DEV_BPS || 200); // 2.00%
-    const TREASURY_BPS = Number(process.env.GE_TREASURY_BPS || 600); // 6.00%
-    const devCut = (pot * DEV_BPS) / 10000;
-    const treasuryCut = (pot * TREASURY_BPS) / 10000;
-    const emissionsTotal = pot;
-    const winnersPot = Math.max(0, pot - devCut - treasuryCut);
-
-    // Winners are wallets that picked winningShip; split pro-rata by qty.
-    const winners = await query(
-      `SELECT wallet, COALESCE(SUM(qty),0) AS qty
-       FROM ge_entries
-       WHERE round_id=$1 AND ship_index=$2
-       GROUP BY wallet`,
-      [round.id, winningShip]
-    );
-
-    const winTotalQty = winners.rows.reduce((a, r) => a + Number(r.qty), 0);
-
-    await query("BEGIN");
-    try {
-      await query(
-        `UPDATE ge_rounds
-         SET status='settled', settled_at=NOW(), winning_ship_index=$2, emissions_total=$3, seed=$4
-         WHERE id=$1`,
-        [round.id, winningShip, emissionsTotal, seed]
-      );
-
-      // record payouts in ge_balances
-      for (const w of winners.rows) {
-        const q = Number(w.qty);
-        if (q <= 0 || winTotalQty <= 0) continue;
-        const amount = (winnersPot * q) / winTotalQty;
-        await query(
-          `INSERT INTO ge_payouts (round_id, wallet, amount) VALUES ($1,$2,$3)`,
-          [round.id, w.wallet, amount]
-        );
-        await query(
-          `INSERT INTO ge_balances (wallet, balance) VALUES ($1,$2)
-           ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + EXCLUDED.balance, updated_at=NOW()`,
-          [w.wallet, amount]
-        );
-      }
-
-      // close round
-      await query(`UPDATE ge_rounds SET status='closed' WHERE id=$1 AND status='open'`, [round.id]);
-      await query("COMMIT");
-    } catch (e) {
-      await query("ROLLBACK");
-      throw e;
-    }
-
-    return res.json({ ok: true, round_id: round.id, winning_ship_index: winningShip, seed, emissions_total: emissionsTotal, pot, winners_pot: winnersPot, dev_cut: devCut, treasury_cut: treasuryCut });
+    if (!round) return res.status(400).json({ error: "No current round" });
+    const out = await settleRound(round);
+    if (!out.ok) return res.status(400).json(out);
+    return res.json(out);
   } catch (e) {
     console.error("POST /api/v2/ge/admin/settle error", e);
     return res.status(500).json({ error: e.message });
+  }
+});
+
+// Auto-settle: if the current round ended, any client poll will finalize it once.
+app.post("/api/v2/ge/round/heartbeat", requireAdmin, async (_req, res) => {
+  try {
+    const round = await getCurrentRound();
+    if (!round) return res.json({ ok: true, round: null });
+    if (round.status === 'running' && round.started_at && Date.now() >= new Date(round.ends_at).getTime()) {
+      const out = await settleRound(round);
+      return res.json(out);
+    }
+    return res.json({ ok: true, round_id: round.id, status: round.status });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/v2/ge/balance", requireAuth, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const r = await query(`SELECT balance FROM ge_balances WHERE wallet=$1`, [wallet]);
+    const bal = r.rowCount ? Number(r.rows[0].balance) : 0;
+    res.json({ ok: true, wallet, balance: bal });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/v2/ge/last", async (_req, res) => {
+  try {
+    const r = await query(`SELECT id, settled_at, winning_ship_index, emissions_total, seed FROM ge_rounds WHERE status='settled' ORDER BY id DESC LIMIT 1`);
+    res.json({ ok: true, last: r.rows[0] || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
