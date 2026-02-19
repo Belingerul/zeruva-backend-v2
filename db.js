@@ -216,8 +216,9 @@ async function initDb() {
   await query(`
     CREATE TABLE IF NOT EXISTS ge_rounds (
       id SERIAL PRIMARY KEY,
-      status TEXT NOT NULL DEFAULT 'open',
+      status TEXT NOT NULL DEFAULT 'filling',
       starts_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      started_at TIMESTAMP,
       ends_at TIMESTAMP NOT NULL,
       ships_count INTEGER NOT NULL DEFAULT 25,
       emissions_total NUMERIC(30, 10) NOT NULL DEFAULT 0,

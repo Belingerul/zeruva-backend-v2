@@ -1768,7 +1768,8 @@ app.post("/api/v2/ge/enter", requireAuth, async (req, res) => {
     if (!round) return res.status(400).json({ error: "No open round" });
 
     const now = new Date();
-    if (now.getTime() > new Date(round.ends_at).getTime()) {
+    // If round is running, enforce end time. If filling, allow entries.
+    if (round.started_at && now.getTime() > new Date(round.ends_at).getTime()) {
       return res.status(400).json({ error: "Round already ended" });
     }
 
@@ -1786,6 +1787,21 @@ app.post("/api/v2/ge/enter", requireAuth, async (req, res) => {
     );
 
     const stats = await getRoundStats(round.id);
+
+    // Auto-start: once every ship has at least 1 entry.
+    // Simulated live action: short rounds by default.
+    if (!round.started_at) {
+      const allFilled = stats.perShip.every((s) => Number(s.qty) >= 1);
+      if (allFilled) {
+        const DURATION_MINUTES = Number(process.env.GE_ROUND_MINUTES || 10);
+        const endsAt = new Date(Date.now() + DURATION_MINUTES * 60 * 1000);
+        await query(
+          `UPDATE ge_rounds SET status='running', started_at=NOW(), ends_at=$2 WHERE id=$1`,
+          [round.id, endsAt]
+        );
+      }
+    }
+
     return res.json({ ok: true, round_id: round.id, stats });
   } catch (e) {
     console.error("POST /api/v2/ge/enter error", e);
@@ -1799,13 +1815,16 @@ app.post("/api/v2/ge/admin/create-round", requireAdmin, async (req, res) => {
     const endsAt = new Date(Date.now() + durationMinutes * 60 * 1000);
 
     // Close any existing open round
-    await query(`UPDATE ge_rounds SET status='closed' WHERE status='open'`);
+    await query(`UPDATE ge_rounds SET status='closed' WHERE status IN ('open','running','filling')`);
+
+    // Create a new filling round. Use a far-future ends_at until it starts.
+    const farFuture = new Date(Date.now() + 1000 * 60 * 60 * 24 * 365 * 50);
 
     const r = await query(
-      `INSERT INTO ge_rounds (status, ends_at, ships_count, emissions_total)
-       VALUES ('open', $1, $2, 0)
+      `INSERT INTO ge_rounds (status, ends_at, ships_count, emissions_total, started_at)
+       VALUES ('filling', $1, $2, 0, NULL)
        RETURNING *`,
-      [endsAt, GE_SHIPS]
+      [farFuture, GE_SHIPS]
     );
 
     return res.json({ ok: true, round: r.rows[0] });
@@ -1821,6 +1840,11 @@ app.post("/api/v2/ge/admin/settle", requireAdmin, async (req, res) => {
     if (!round) return res.status(400).json({ error: "No open round" });
 
     const now = new Date();
+
+    if (!round.started_at || round.status !== 'running') {
+      return res.status(400).json({ error: "Round not running" });
+    }
+
     const endsAt = new Date(round.ends_at);
     if (now.getTime() < endsAt.getTime()) {
       return res.status(400).json({ error: "Round not ended yet" });
