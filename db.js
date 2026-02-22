@@ -24,10 +24,30 @@ if (USING_PGMEM) {
     // To avoid crash-loops, default to relaxed verification when running on Railway unless explicitly overridden.
     const envReject = process.env.DB_SSL_REJECT_UNAUTHORIZED;
     const onRailway = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
-    const rejectUnauthorized =
-      envReject === undefined
-        ? !onRailway
-        : envReject !== "false";
+
+    // Strong default for Railway: disable verification to avoid SELF_SIGNED_CERT_IN_CHAIN.
+    // You can force verification by setting FORCE_DB_VERIFY=1.
+    const forceVerify = ["1", "true", "on"].includes((process.env.FORCE_DB_VERIFY || "").toLowerCase());
+
+    let rejectUnauthorized;
+    if (onRailway && !forceVerify) {
+      rejectUnauthorized = false;
+    } else if (envReject === undefined) {
+      rejectUnauthorized = true;
+    } else {
+      rejectUnauthorized = envReject !== "false";
+    }
+
+    if (process.env.DEBUG_DB_SSL === "1") {
+      console.log("[db] ssl config", {
+        onRailway,
+        forceVerify,
+        envReject,
+        rejectUnauthorized,
+        hasCa: !!process.env.DB_SSL_CA,
+        pgsslmode: process.env.PGSSLMODE,
+      });
+    }
 
 
     // Optional custom CA (PEM string)
