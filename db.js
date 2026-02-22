@@ -224,8 +224,18 @@ async function initDb() {
       emissions_total NUMERIC(30, 10) NOT NULL DEFAULT 0,
       winning_ship_index INTEGER,
       settled_at TIMESTAMP,
-      seed TEXT
+      seed TEXT,
+      seed_commit TEXT,
+      seed_reveal TEXT,
+      alien_ids TEXT,
+      game_mode TEXT
     );
+
+    -- Ensure new columns exist if schema evolves
+    ALTER TABLE ge_rounds ADD COLUMN IF NOT EXISTS seed_commit TEXT;
+    ALTER TABLE ge_rounds ADD COLUMN IF NOT EXISTS seed_reveal TEXT;
+    ALTER TABLE ge_rounds ADD COLUMN IF NOT EXISTS alien_ids TEXT;
+    ALTER TABLE ge_rounds ADD COLUMN IF NOT EXISTS game_mode TEXT;
 
     CREATE TABLE IF NOT EXISTS ge_entries (
       id SERIAL PRIMARY KEY,

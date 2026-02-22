@@ -107,6 +107,8 @@ app.use(
 
 app.use(express.json({ limit: "1mb" }));
 app.use("/static", express.static(path.join(__dirname, "public")));
+// Allow frontend to load images through Next.js /api rewrite (tunnel-friendly)
+app.use("/api/static", express.static(path.join(__dirname, "public")));
 
 const ADMIN_WALLET = process.env.ADMIN_WALLET;
 const DEV_WALLET_SECRET_KEY = process.env.DEV_WALLET_SECRET_KEY;
@@ -183,6 +185,20 @@ async function getNonce(wallet) {
 }
 
 function requireAuth(req, res, next) {
+  // Dev convenience: allow "guest" wallets for local testing without Phantom/signatures.
+  // Enable explicitly: DEV_GUEST_AUTH=1
+  if (process.env.DEV_GUEST_AUTH === "1") {
+    const devWallet =
+      req.headers["x-dev-wallet"] ||
+      req.query.wallet ||
+      req.body?.wallet;
+
+    if (typeof devWallet === "string" && devWallet.trim()) {
+      req.auth = { wallet: devWallet.trim(), dev: true };
+      return next();
+    }
+  }
+
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Missing Bearer token" });
@@ -1699,8 +1715,36 @@ app.post("/api/confirm-buy-spaceship", requireAuth, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 // ===== Great Expedition (v2) API =====
-const GE_SHIPS = 25;
+const GE_SHIPS = 15;
 const GE_ADMIN_KEY = process.env.GE_ADMIN_KEY || "";
+const GE_TREASURY_WALLET = process.env.GE_TREASURY_WALLET || ADMIN_WALLET;
+
+const GE_GAME_MODES = ["roulette", "elimination", "race"]; // rotate per round
+function pickGameMode(nextRoundId) {
+  // deterministic rotation (shared across all clients)
+  return GE_GAME_MODES[(Number(nextRoundId || 0) - 1) % GE_GAME_MODES.length] || "roulette";
+}
+
+function genUniqueAlienIds(n) {
+  const poolSize = Math.max(n, Number(process.env.ALIEN_COUNT || 60));
+  // Create [1..poolSize] and do a partial Fisher-Yates shuffle for first n.
+  const arr = Array.from({ length: poolSize }, (_, i) => i + 1);
+  for (let i = 0; i < n; i++) {
+    const j = i + crypto.randomInt(0, poolSize - i);
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  return arr.slice(0, n);
+}
+
+
+// Tokenomics (recommended defaults)
+const GE_ENTRY_PRICE_SOL = Number(process.env.GE_ENTRY_PRICE_SOL || 0.1); // min 0.1 SOL per entry
+// Payout split (bps)
+const GE_WINNER_BPS = Number(process.env.GE_WINNER_BPS || 7000);
+const GE_PARTICIPATION_BPS = Number(process.env.GE_PARTICIPATION_BPS || 2500);
+const GE_TREASURY_BPS = Number(process.env.GE_TREASURY_BPS || 500);
 
 function requireAdmin(req, res, next) {
   if (!GE_ADMIN_KEY) return res.status(500).json({ error: "Server misconfigured (GE_ADMIN_KEY missing)" });
@@ -1710,8 +1754,9 @@ function requireAdmin(req, res, next) {
 }
 
 async function getCurrentRound() {
+  // Include 'settled' so the frontend can see the result and animate.
   const r = await query(
-    `SELECT * FROM ge_rounds WHERE status IN ('filling','running') ORDER BY id DESC LIMIT 1`
+    `SELECT * FROM ge_rounds WHERE status IN ('filling','running','settled') ORDER BY id DESC LIMIT 1`
   );
   return r.rows[0] || null;
 }
@@ -1736,15 +1781,55 @@ async function getRoundStats(roundId) {
 app.get("/api/v2/ge/round/current", async (_req, res) => {
   // Ensure a current round exists
   let round = await getCurrentRound();
+
+  // If the last round is settled for a bit, automatically start a new one.
+  if (round?.status === "settled") {
+    const settledAt = round.settled_at ? new Date(round.settled_at).getTime() : 0;
+
+    // Keep settled rounds longer for animation-heavy modes so mobile can finish.
+    const mode = round.game_mode || "roulette";
+    const keepMs =
+      mode === "elimination" ? 12000 :
+      mode === "race" ? 8000 :
+      Number(process.env.GE_SHOW_RESULT_MS || 6000);
+
+    if (settledAt && Date.now() - settledAt > keepMs) {
+      round = null;
+    }
+  }
+
   if (!round) {
-    const farFuture = new Date(Date.now() + 1000 * 60 * 60 * 24 * 365 * 50);
+    const DURATION_MINUTES = Number(process.env.GE_ROUND_MINUTES || 10);
+    const endsAt = new Date(Date.now() + DURATION_MINUTES * 60 * 1000);
+
+    const secret = crypto.randomBytes(32).toString("hex");
+    const commit = crypto.createHash("sha256").update(secret).digest("hex");
+
+    const aliens = genUniqueAlienIds(GE_SHIPS);
+
     const r = await query(
-      `INSERT INTO ge_rounds (status, ends_at, ships_count, emissions_total, started_at)
-       VALUES ('filling', $1, $2, 0, NULL)
+      `INSERT INTO ge_rounds (status, ends_at, ships_count, emissions_total, started_at, seed_commit, seed_reveal, alien_ids, game_mode)
+       VALUES ('running', $1, $2, 0, NOW(), $3, $4, $5, NULL)
        RETURNING *`,
-      [farFuture, GE_SHIPS]
+      [endsAt, GE_SHIPS, commit, secret, JSON.stringify(aliens)]
     );
-    round = r.rows[0];
+    const created = r.rows[0];
+    const mode = pickGameMode(created.id);
+    await query(`UPDATE ge_rounds SET game_mode=$2 WHERE id=$1`, [created.id, mode]);
+    round = { ...created, game_mode: mode };
+  }
+
+  // Auto-settle when ended (dev-friendly). This makes the UI announce results
+  // without needing an admin call.
+  if (round.status === "running" && round.started_at && Date.now() >= new Date(round.ends_at).getTime()) {
+    try {
+      await settleRound(round);
+    } catch (e) {
+      // ignore settle errors; client can retry on next poll
+      console.warn("[ge] auto-settle failed", e?.message || e);
+    }
+    // reload round state after settlement attempt
+    round = await getCurrentRound();
   }
 
   const stats = await getRoundStats(round.id);
@@ -1759,6 +1844,11 @@ app.get("/api/v2/ge/round/current", async (_req, res) => {
       ships_count: round.ships_count,
       emissions_total: Number(round.emissions_total || 0),
       winning_ship_index: round.winning_ship_index ?? null,
+      seed_commit: round.seed_commit ?? null,
+      alien_ids: (() => {
+        try { return round.alien_ids ? JSON.parse(round.alien_ids) : null; } catch { return null; }
+      })(),
+      game_mode: round.game_mode || "roulette",
       // seed is only meaningful after settle; still included for audit
       seed: round.seed ?? null,
     },
@@ -1766,8 +1856,10 @@ app.get("/api/v2/ge/round/current", async (_req, res) => {
     config: {
       ships: GE_SHIPS,
       round_minutes: Number(process.env.GE_ROUND_MINUTES || 10),
-      dev_bps: Number(process.env.GE_DEV_BPS || 200),
-      treasury_bps: Number(process.env.GE_TREASURY_BPS || 600),
+      entry_price_sol: GE_ENTRY_PRICE_SOL,
+      winner_bps: GE_WINNER_BPS,
+      participation_bps: GE_PARTICIPATION_BPS,
+      treasury_bps: GE_TREASURY_BPS,
     },
   });
 });
@@ -1789,6 +1881,162 @@ app.get("/api/v2/ge/me", requireAuth, async (req, res) => {
   return res.json({ ok: true, round_id: round.id, my: mine.rows.map(r => ({ ship_index: Number(r.ship_index), qty: Number(r.qty) })) });
 });
 
+// Build a SOL transfer tx for boarding (devnet). Frontend signs & submits.
+app.post("/api/v2/ge/buy-entry", geEnterLimiter, requireAuth, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    if (!wallet) return res.status(401).json({ error: "Unauthorized" });
+
+    if (!GE_TREASURY_WALLET) {
+      return res.status(500).json({ error: "Server misconfigured (GE_TREASURY_WALLET missing)" });
+    }
+
+    const round = await getCurrentRound();
+    if (!round || round.status !== "running") return res.status(400).json({ error: "No running round" });
+
+    const shipIndex = Number(req.body?.ship_index);
+    const qty = Math.max(1, Math.min(100, Number(req.body?.qty || 1)));
+    if (!Number.isInteger(shipIndex) || shipIndex < 0 || shipIndex >= GE_SHIPS) {
+      return res.status(400).json({ error: "Invalid ship_index" });
+    }
+
+    const now = new Date();
+    const cutoffMs = Number(process.env.GE_ENTRY_CUTOFF_MS || 15000);
+    if (round.started_at && now.getTime() > new Date(round.ends_at).getTime() - cutoffMs) {
+      return res.status(400).json({ error: "Round entry closed" });
+    }
+
+    const lamports = Math.round(qty * GE_ENTRY_PRICE_SOL * 1_000_000_000);
+    if (!Number.isFinite(lamports) || lamports <= 0) return res.status(400).json({ error: "Invalid amount" });
+
+    // Intent binds: round_id + ship_index + qty + lamports.
+    const intentId = nanoid(24);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    await query(
+      `INSERT INTO payment_intents (id, wallet, kind, price_usd, sol_usd, lamports, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [intentId, wallet, `ge_entry:${round.id}:${shipIndex}:${qty}`, 0, 0, String(lamports), expiresAt]
+    );
+
+    const tx = await buildTransferTx({
+      rpcUrl: RPC_URL,
+      fromPubkey: wallet,
+      toPubkey: GE_TREASURY_WALLET,
+      lamports,
+    });
+
+    const serialized = Buffer.from(
+      tx.serialize({ requireAllSignatures: false, verifySignatures: false })
+    ).toString("base64");
+
+    return res.json({
+      ok: true,
+      intentId,
+      serialized,
+      lamports,
+      amountSol: lamportsToSol(lamports),
+      to: GE_TREASURY_WALLET,
+      round_id: round.id,
+      ship_index: shipIndex,
+      qty,
+      expiresAt: expiresAt.toISOString(),
+    });
+  } catch (e) {
+    console.error("POST /api/v2/ge/buy-entry error", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/v2/ge/confirm-entry", geEnterLimiter, requireAuth, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const { signature, intentId } = req.body || {};
+    if (!wallet || !signature || !intentId) return res.status(400).json({ error: "missing fields" });
+
+    const intent = await query(
+      `SELECT id, wallet, kind, lamports, expires_at
+       FROM payment_intents
+       WHERE id = $1`,
+      [intentId]
+    );
+    if (intent.rowCount === 0) return res.status(400).json({ error: "invalid intent" });
+
+    const row = intent.rows[0];
+    if (row.wallet !== wallet) return res.status(403).json({ error: "intent wallet mismatch" });
+    if (new Date(row.expires_at).getTime() < Date.now()) return res.status(410).json({ error: "intent expired" });
+
+    const parts = String(row.kind || "").split(":");
+    // kind: ge_entry:roundId:shipIndex:qty
+    if (parts.length !== 4 || parts[0] !== "ge_entry") return res.status(400).json({ error: "intent kind mismatch" });
+
+    const roundId = Number(parts[1]);
+    const shipIndex = Number(parts[2]);
+    const qty = Number(parts[3]);
+    const minLamports = Number(row.lamports);
+
+    // Prevent replay
+    const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [signature]);
+    if (already.rowCount > 0) {
+      return res.status(409).json({ error: "payment already processed" });
+    }
+
+    const verify = await verifySolPayment({
+      rpcUrl: RPC_URL,
+      signature,
+      expectedFrom: wallet,
+      expectedTo: GE_TREASURY_WALLET,
+      minLamports,
+    });
+
+    if (!verify.ok) return res.status(400).json({ error: "invalid payment", detail: verify });
+
+    // Check round is still running
+    const round = await query(`SELECT * FROM ge_rounds WHERE id=$1`, [roundId]);
+    const r = round.rows[0];
+    if (!r || r.status !== "running") return res.status(400).json({ error: "round not running" });
+
+    const cutoffMs = Number(process.env.GE_ENTRY_CUTOFF_MS || 15000);
+    if (Date.now() > new Date(r.ends_at).getTime() - cutoffMs) {
+      return res.status(400).json({ error: "Round entry closed" });
+    }
+
+    await query("BEGIN");
+    try {
+      await query(
+        `INSERT INTO payments (signature, wallet, kind, amount_sol, metadata)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          signature,
+          wallet,
+          `ge_entry:${roundId}`,
+          lamportsToSol(minLamports),
+          JSON.stringify({ intentId, roundId, shipIndex, qty, lamports: minLamports }),
+        ]
+      );
+
+      // Intent is single-use
+      await query(`DELETE FROM payment_intents WHERE id=$1`, [intentId]);
+
+      await query(
+        `INSERT INTO ge_entries (round_id, wallet, ship_index, qty)
+         VALUES ($1,$2,$3,$4)`,
+        [roundId, wallet, shipIndex, qty]
+      );
+
+      await query("COMMIT");
+    } catch (e) {
+      await query("ROLLBACK");
+      throw e;
+    }
+
+    const stats = await getRoundStats(roundId);
+    return res.json({ ok: true, round_id: roundId, stats });
+  } catch (e) {
+    console.error("POST /api/v2/ge/confirm-entry error", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/v2/ge/enter", geEnterLimiter, requireAuth, async (req, res) => {
   try {
     const wallet = req.auth?.wallet;
@@ -1796,9 +2044,10 @@ app.post("/api/v2/ge/enter", geEnterLimiter, requireAuth, async (req, res) => {
     if (!round) return res.status(400).json({ error: "No open round" });
 
     const now = new Date();
-    // If round is running, enforce end time. If filling, allow entries.
-    if (round.started_at && now.getTime() > new Date(round.ends_at).getTime()) {
-      return res.status(400).json({ error: "Round already ended" });
+    // If round is running, enforce end time with a small cutoff to avoid last-millisecond sniping.
+    const cutoffMs = Number(process.env.GE_ENTRY_CUTOFF_MS || 15000);
+    if (round.started_at && now.getTime() > new Date(round.ends_at).getTime() - cutoffMs) {
+      return res.status(400).json({ error: "Round entry closed" });
     }
 
     const shipIndex = Number(req.body?.ship_index);
@@ -1816,19 +2065,7 @@ app.post("/api/v2/ge/enter", geEnterLimiter, requireAuth, async (req, res) => {
 
     const stats = await getRoundStats(round.id);
 
-    // Auto-start: once every ship has at least 1 entry.
-    // Simulated live action: short rounds by default.
-    if (!round.started_at) {
-      const allFilled = stats.perShip.every((s) => Number(s.qty) >= 1);
-      if (allFilled) {
-        const DURATION_MINUTES = Number(process.env.GE_ROUND_MINUTES || 10);
-        const endsAt = new Date(Date.now() + DURATION_MINUTES * 60 * 1000);
-        await query(
-          `UPDATE ge_rounds SET status='running', started_at=NOW(), ends_at=$2 WHERE id=$1`,
-          [round.id, endsAt]
-        );
-      }
-    }
+    // Note: rounds are created as running in dev; no auto-start needed here.
 
     // Enforce state: once running ends, no more entries.
     // (We keep it strict to prevent last-millisecond sniping.)
@@ -1846,23 +2083,30 @@ app.post("/api/v2/ge/enter", geEnterLimiter, requireAuth, async (req, res) => {
 
 app.post("/api/v2/ge/admin/create-round", requireAdmin, async (req, res) => {
   try {
-    const durationMinutes = Math.max(5, Math.min(24*60, Number(req.body?.duration_minutes || 60)));
+    const durationMinutes = Math.max(1, Math.min(24 * 60, Number(req.body?.duration_minutes || 1)));
     const endsAt = new Date(Date.now() + durationMinutes * 60 * 1000);
 
     // Close any existing open round
     await query(`UPDATE ge_rounds SET status='closed' WHERE status IN ('open','running','filling')`);
 
-    // Create a new filling round. Use a far-future ends_at until it starts.
-    const farFuture = new Date(Date.now() + 1000 * 60 * 60 * 24 * 365 * 50);
+    const secret = crypto.randomBytes(32).toString("hex");
+    const commit = crypto.createHash("sha256").update(secret).digest("hex");
+
+    // Create a new running round immediately (dev-friendly)
+    const aliens = genUniqueAlienIds(GE_SHIPS);
 
     const r = await query(
-      `INSERT INTO ge_rounds (status, ends_at, ships_count, emissions_total, started_at)
-       VALUES ('filling', $1, $2, 0, NULL)
+      `INSERT INTO ge_rounds (status, ends_at, ships_count, emissions_total, started_at, seed_commit, seed_reveal, alien_ids, game_mode)
+       VALUES ('running', $1, $2, 0, NOW(), $3, $4, $5, NULL)
        RETURNING *`,
-      [farFuture, GE_SHIPS]
+      [endsAt, GE_SHIPS, commit, secret, JSON.stringify(aliens)]
     );
 
-    return res.json({ ok: true, round: r.rows[0] });
+    const created = r.rows[0];
+    const mode = pickGameMode(created.id);
+    await query(`UPDATE ge_rounds SET game_mode=$2 WHERE id=$1`, [created.id, mode]);
+
+    return res.json({ ok: true, round: { ...created, game_mode: mode } });
   } catch (e) {
     console.error("POST /api/v2/ge/admin/create-round error", e);
     return res.status(500).json({ error: e.message });
@@ -1882,24 +2126,37 @@ async function settleRound(round) {
   }
 
   const stats = await getRoundStats(round.id);
+  // Commit–reveal style seed: round has a secret (seed_reveal) stored server-side.
+  // We never expose seed_reveal; clients may see seed_commit for audit.
+  const secret = round.seed_reveal || crypto.randomBytes(32).toString("hex");
   const seed = crypto
     .createHash("sha256")
-    .update(`${round.id}:${endsAt.toISOString()}:${stats.totalEntries}:${GE_ADMIN_KEY || "no-admin-key"}`)
+    .update(`${secret}:${round.id}:${endsAt.toISOString()}:${stats.totalEntries}`)
     .digest("hex");
 
-  // Pick winning ship: equal chance per ship (0..24)
-  const n = parseInt(seed.slice(0, 8), 16);
-  const winningShip = n % GE_SHIPS;
+  // Winner selection: weighted by entries (tickets), not by ship.
+  // This makes P(win ship i) proportional to entries on that ship.
+  let winningShip = 0;
+  if (stats.totalEntries > 0) {
+    const ticket = parseInt(seed.slice(0, 12), 16) % stats.totalEntries;
+    let acc = 0;
+    for (let i = 0; i < GE_SHIPS; i++) {
+      acc += Number(stats.perShip[i]?.qty || 0);
+      if (ticket < acc) {
+        winningShip = i;
+        break;
+      }
+    }
+  }
 
-  const pot = Number(stats.totalEntries);
-  const DEV_BPS = Number(process.env.GE_DEV_BPS || 200);
-  const TREASURY_BPS = Number(process.env.GE_TREASURY_BPS || 600);
-  const devCut = (pot * DEV_BPS) / 10000;
-  const treasuryCut = (pot * TREASURY_BPS) / 10000;
-  const emissionsTotal = pot;
-  const winnersPot = Math.max(0, pot - devCut - treasuryCut);
+  const potSol = Number(stats.totalEntries) * GE_ENTRY_PRICE_SOL;
+  const emissionsTotal = potSol;
 
-  // Winners are wallets that picked winningShip; split pro-rata by qty.
+  const treasuryCut = (potSol * GE_TREASURY_BPS) / 10000;
+  const winnerPot = (potSol * GE_WINNER_BPS) / 10000;
+  const participationPot = (potSol * GE_PARTICIPATION_BPS) / 10000;
+
+  // Winners are wallets that picked winningShip; split pro-rata by qty on that ship.
   const winners = await query(
     `SELECT wallet, COALESCE(SUM(qty),0) AS qty
      FROM ge_entries
@@ -1907,18 +2164,33 @@ async function settleRound(round) {
      GROUP BY wallet`,
     [round.id, winningShip]
   );
-
   const winTotalQty = winners.rows.reduce((a, r) => a + Number(r.qty), 0);
+
+  // Participation: all wallets split pro-rata by total entries (across all ships).
+  const participants = await query(
+    `SELECT wallet, COALESCE(SUM(qty),0) AS qty
+     FROM ge_entries
+     WHERE round_id=$1
+     GROUP BY wallet`,
+    [round.id]
+  );
+  const partTotalQty = participants.rows.reduce((a, r) => a + Number(r.qty), 0);
 
   await query("BEGIN");
   try {
     // Idempotency: only the first settler succeeds.
     const upd = await query(
       `UPDATE ge_rounds
-       SET status='settled', settled_at=NOW(), winning_ship_index=$2, emissions_total=$3, seed=$4
+       SET status='settled',
+           settled_at=NOW(),
+           winning_ship_index=$2,
+           emissions_total=$3,
+           seed=$4,
+           seed_commit=COALESCE(seed_commit, $5),
+           seed_reveal=COALESCE(seed_reveal, $6)
        WHERE id=$1 AND status='running'
        RETURNING id`,
-      [round.id, winningShip, emissionsTotal, seed]
+      [round.id, winningShip, emissionsTotal, seed, crypto.createHash("sha256").update(secret).digest("hex"), secret]
     );
 
     if (upd.rowCount === 0) {
@@ -1926,14 +2198,7 @@ async function settleRound(round) {
       return { ok: true, already_settled: true, round_id: round.id };
     }
 
-    // dev + treasury balances
-    if (devCut > 0) {
-      await query(
-        `INSERT INTO ge_balances (wallet, balance) VALUES ('__dev__', $1)
-         ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + EXCLUDED.balance, updated_at=NOW()`,
-        [devCut]
-      );
-    }
+    // Treasury balance
     if (treasuryCut > 0) {
       await query(
         `INSERT INTO ge_balances (wallet, balance) VALUES ('__treasury__', $1)
@@ -1942,15 +2207,27 @@ async function settleRound(round) {
       );
     }
 
-    // record payouts in ge_balances
+    // Participation payouts
+    for (const p of participants.rows) {
+      const q = Number(p.qty);
+      if (q <= 0 || partTotalQty <= 0) continue;
+      const amount = (participationPot * q) / partTotalQty;
+      if (amount <= 0) continue;
+      await query(`INSERT INTO ge_payouts (round_id, wallet, amount) VALUES ($1,$2,$3)`, [round.id, p.wallet, amount]);
+      await query(
+        `INSERT INTO ge_balances (wallet, balance) VALUES ($1,$2)
+         ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + EXCLUDED.balance, updated_at=NOW()`,
+        [p.wallet, amount]
+      );
+    }
+
+    // Winner payouts
     for (const w of winners.rows) {
       const q = Number(w.qty);
       if (q <= 0 || winTotalQty <= 0) continue;
-      const amount = (winnersPot * q) / winTotalQty;
-      await query(
-        `INSERT INTO ge_payouts (round_id, wallet, amount) VALUES ($1,$2,$3)`,
-        [round.id, w.wallet, amount]
-      );
+      const amount = (winnerPot * q) / winTotalQty;
+      if (amount <= 0) continue;
+      await query(`INSERT INTO ge_payouts (round_id, wallet, amount) VALUES ($1,$2,$3)`, [round.id, w.wallet, amount]);
       await query(
         `INSERT INTO ge_balances (wallet, balance) VALUES ($1,$2)
          ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + EXCLUDED.balance, updated_at=NOW()`,
@@ -1968,12 +2245,14 @@ async function settleRound(round) {
     ok: true,
     round_id: round.id,
     winning_ship_index: winningShip,
+    seed_commit: round.seed_commit || null,
     seed,
     emissions_total: emissionsTotal,
-    pot,
-    winners_pot: winnersPot,
-    dev_cut: devCut,
+    pot_sol: potSol,
+    winner_pot: winnerPot,
+    participation_pot: participationPot,
     treasury_cut: treasuryCut,
+    ends_at: endsAt.toISOString(),
   };
 }
 
@@ -2018,16 +2297,148 @@ app.get("/api/v2/ge/balance", requireAuth, async (req, res) => {
 
 app.get("/api/v2/ge/last", async (_req, res) => {
   try {
-    const r = await query(`SELECT id, settled_at, winning_ship_index, emissions_total, seed FROM ge_rounds WHERE status='settled' ORDER BY id DESC LIMIT 1`);
+    const r = await query(`SELECT id, settled_at, winning_ship_index, emissions_total, seed, alien_ids, game_mode FROM ge_rounds WHERE status='settled' ORDER BY id DESC LIMIT 1`);
     res.json({ ok: true, last: r.rows[0] || null });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+// Settled round summary (for winner modal / stats)
+app.get("/api/v2/ge/round/summary", async (_req, res) => {
+  try {
+    const roundIdParam = req.query.round_id ? Number(req.query.round_id) : null;
+    const r = roundIdParam
+      ? await query(`SELECT * FROM ge_rounds WHERE id=$1 AND status='settled' LIMIT 1`, [roundIdParam])
+      : await query(`SELECT * FROM ge_rounds WHERE status='settled' ORDER BY id DESC LIMIT 1`);
+    const round = r.rows[0];
+    if (!round) return res.json({ ok: true, round: null });
+
+    const stats = await getRoundStats(round.id);
+    const potSol = Number(stats.totalEntries) * GE_ENTRY_PRICE_SOL;
+    const treasuryCut = (potSol * GE_TREASURY_BPS) / 10000;
+    const winnerPot = (potSol * GE_WINNER_BPS) / 10000;
+    const participationPot = (potSol * GE_PARTICIPATION_BPS) / 10000;
+
+    const participantsCount = await query(
+      `SELECT COUNT(DISTINCT wallet) AS c FROM ge_entries WHERE round_id=$1`,
+      [round.id]
+    );
+    const payoutsSum = await query(
+      `SELECT COALESCE(SUM(amount),0) AS s FROM ge_payouts WHERE round_id=$1`,
+      [round.id]
+    );
+
+    let alienIds = null;
+    try { alienIds = round.alien_ids ? JSON.parse(round.alien_ids) : null; } catch {}
+    const winIndex = Number(round.winning_ship_index ?? 0);
+    const winnerAlien = Array.isArray(alienIds) ? alienIds[winIndex] : null;
+
+    res.json({
+      ok: true,
+      round: {
+        id: round.id,
+        game_mode: round.game_mode || "roulette",
+        winning_index: winIndex,
+        winner_alien: winnerAlien,
+        settled_at: round.settled_at,
+      },
+      pot_sol: potSol,
+      winner_pot: winnerPot,
+      participation_pot: participationPot,
+      treasury_cut: treasuryCut,
+      participants: Number(participantsCount.rows[0]?.c || 0),
+      distributed_total: Number(payoutsSum.rows[0]?.s || 0),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/v2/ge/round/payouts", async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit || 20)));
+    const roundIdParam = req.query.round_id ? Number(req.query.round_id) : null;
+    const r = roundIdParam
+      ? await query(`SELECT id FROM ge_rounds WHERE id=$1 AND status='settled' LIMIT 1`, [roundIdParam])
+      : await query(`SELECT id FROM ge_rounds WHERE status='settled' ORDER BY id DESC LIMIT 1`);
+    const round = r.rows[0];
+    if (!round) return res.json({ ok: true, round_id: null, payouts: [] });
+
+    const rows = await query(
+      `SELECT p.wallet, p.amount,
+              COALESCE(e.qty, 0) AS entries
+       FROM ge_payouts p
+       LEFT JOIN (
+         SELECT wallet, COALESCE(SUM(qty),0) AS qty
+         FROM ge_entries
+         WHERE round_id=$1
+         GROUP BY wallet
+       ) e ON e.wallet = p.wallet
+       WHERE p.round_id=$1
+       ORDER BY p.amount DESC
+       LIMIT $2`,
+      [round.id, limit]
+    );
+
+    res.json({
+      ok: true,
+      round_id: round.id,
+      payouts: rows.rows.map((x) => ({
+        wallet: x.wallet,
+        amount: Number(x.amount),
+        entries: Number(x.entries),
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function startGreatExpeditionSimulator() {
+  if (process.env.GE_SIMULATOR !== "1") return;
+
+  console.log("🤖 GE simulator enabled");
+
+  const intervalMs = Number(process.env.GE_SIM_INTERVAL_MS || 2500);
+  const maxBots = Number(process.env.GE_SIM_MAX_BOTS || GE_SHIPS);
+
+  // lightweight "live action": bots place small entries on random ships while round is running.
+  setInterval(async () => {
+    try {
+      const round = await getCurrentRound();
+      if (!round || round.status !== "running") return;
+
+      // stop creating entries close to the end
+      const cutoffMs = Number(process.env.GE_ENTRY_CUTOFF_MS || 15000);
+      if (Date.now() > new Date(round.ends_at).getTime() - cutoffMs) return;
+
+      // decide number of actions this tick
+      const actions = 1 + crypto.randomInt(0, 3); // 1-3
+
+      for (let a = 0; a < actions; a++) {
+        const botId = crypto.randomInt(0, maxBots);
+        const wallet = `bot-${botId}`;
+        const shipIndex = crypto.randomInt(0, GE_SHIPS);
+        const qty = 1 + crypto.randomInt(0, 2); // 1-2 (smaller bot buys)
+
+        await query(
+          `INSERT INTO ge_entries (round_id, wallet, ship_index, qty)
+           VALUES ($1,$2,$3,$4)`,
+          [round.id, wallet, shipIndex, qty]
+        );
+      }
+    } catch (e) {
+      // don't crash the process
+      console.warn("[ge] simulator tick failed", e?.message || e);
+    }
+  }, intervalMs);
+}
+
 initDb()
   .then(() => {
     app.listen(PORT, () => console.log(`✅ Zeruva API running on ${PORT}`));
+    startGreatExpeditionSimulator();
   })
   .catch((err) => {
     console.error("❌ Failed to initialize DB", err);
