@@ -2400,10 +2400,14 @@ function startGreatExpeditionSimulator() {
 
   console.log("🤖 GE simulator enabled");
 
+  const simEnabled = !["0","false","off"].includes((process.env.GE_SIM_ENABLED || "").toLowerCase());
   const intervalMs = Number(process.env.GE_SIM_INTERVAL_MS || 2500);
   const maxBots = Number(process.env.GE_SIM_MAX_BOTS || GE_SHIPS);
 
   // lightweight "live action": bots place small entries on random ships while round is running.
+  if (!simEnabled) {
+    console.log("🤖 GE simulator disabled (GE_SIM_ENABLED=false)");
+  } else {
   setInterval(async () => {
     try {
       const round = await getCurrentRound();
@@ -2433,6 +2437,7 @@ function startGreatExpeditionSimulator() {
       console.warn("[ge] simulator tick failed", e?.message || e);
     }
   }, intervalMs);
+  }
 }
 
 initDb()
