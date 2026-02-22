@@ -20,7 +20,15 @@ if (USING_PGMEM) {
     if (process.env.PGSSLMODE === "disable") return false;
 
     // Default to secure verification.
-    const rejectUnauthorized = process.env.DB_SSL_REJECT_UNAUTHORIZED !== "false";
+    // Railway Postgres commonly presents a cert chain that Node's pg treats as self-signed.
+    // To avoid crash-loops, default to relaxed verification when running on Railway unless explicitly overridden.
+    const envReject = process.env.DB_SSL_REJECT_UNAUTHORIZED;
+    const onRailway = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
+    const rejectUnauthorized =
+      envReject === undefined
+        ? !onRailway
+        : envReject !== "false";
+
 
     // Optional custom CA (PEM string)
     const ca = process.env.DB_SSL_CA;
