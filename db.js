@@ -259,6 +259,8 @@ async function initDb() {
     ALTER TABLE ge_rounds ADD COLUMN IF NOT EXISTS seed_reveal TEXT;
     ALTER TABLE ge_rounds ADD COLUMN IF NOT EXISTS alien_ids TEXT;
     ALTER TABLE ge_rounds ADD COLUMN IF NOT EXISTS game_mode TEXT;
+    -- Lobby rounds ('filling') have no countdown yet, so ends_at must be nullable.
+    ALTER TABLE ge_rounds ALTER COLUMN ends_at DROP NOT NULL;
 
     CREATE TABLE IF NOT EXISTS ge_entries (
       id SERIAL PRIMARY KEY,
@@ -296,6 +298,7 @@ async function initDb() {
       image TEXT NOT NULL,
       tier TEXT NOT NULL,
       roi DOUBLE PRECISION NOT NULL,
+      nft_mint TEXT,
       obtained_at TIMESTAMP DEFAULT NOW()
     );
   `);
@@ -442,6 +445,24 @@ async function initDb() {
       END$$;
     `);
   }
+
+  // Marketplace listings
+  await query(`
+    CREATE TABLE IF NOT EXISTS marketplace_listings (
+      id          SERIAL PRIMARY KEY,
+      seller_wallet TEXT NOT NULL,
+      alien_db_id   INTEGER NOT NULL,
+      alien_id      INTEGER NOT NULL,
+      tier          TEXT NOT NULL,
+      roi           INTEGER NOT NULL DEFAULT 0,
+      nft_mint      TEXT,
+      price_sol     NUMERIC(18,9) NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'active',
+      listed_at     TIMESTAMPTZ DEFAULT now(),
+      sold_at       TIMESTAMPTZ,
+      buyer_wallet  TEXT
+    );
+  `);
 
   console.log("✅ Database tables ensured/created");
 }

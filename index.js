@@ -13,6 +13,7 @@ const { PublicKey, Keypair, Connection, SystemProgram, Transaction } = require("
 const { buildTransferTx, verifySolPayment } = require("./src/sol");
 const { getSolUsdPrice, usdToLamports } = require("./src/pricing");
 const { initDb, query } = require("./db");
+const { mintAlienNft } = require("./nft/metaplex");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -29,13 +30,29 @@ app.use(
   })
 );
 
-// Global request rate limiting (coarse)
+// ── Rate limiting on/off ──────────────────────────────────────────────────
+// Rate limits are a PRODUCTION safeguard. In local dev every browser request
+// reaches this API through the Next.js proxy as 127.0.0.1, so per-IP limits
+// bucket the whole app together and 429 normal navigation. Disabled locally;
+// set FORCE_RATE_LIMIT=1 to exercise the limits in dev.
+const RATE_LIMIT_ON =
+  process.env.NODE_ENV === "production" || process.env.FORCE_RATE_LIMIT === "1";
+const rlSkip = (extra) => (req) =>
+  !RATE_LIMIT_ON || (typeof extra === "function" ? extra(req) : false);
+
+// Global request rate limiting (coarse).
+// Static images are exempt — they route through the same Next.js /api rewrite,
+// so one gallery page can burn hundreds of requests and 429 real API calls.
 app.use(
   rateLimit({
     windowMs: 60_000,
-    max: 600,
+    max: 1200,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: rlSkip((req) =>
+      req.path.startsWith("/static") ||
+      req.path.startsWith("/api/static") ||
+      req.path.startsWith("/nft/metadata")),
   })
 );
 
@@ -45,6 +62,7 @@ const authNonceLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: rlSkip(),
 });
 
 const authVerifyLimiter = rateLimit({
@@ -52,6 +70,7 @@ const authVerifyLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: rlSkip(),
 });
 
 const expeditionStartLimiter = rateLimit({
@@ -59,6 +78,7 @@ const expeditionStartLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: rlSkip(),
 });
 
 const upgradeWithItemsLimiter = rateLimit({
@@ -66,6 +86,7 @@ const upgradeWithItemsLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: rlSkip(),
 });
 
 const geEnterLimiter = rateLimit({
@@ -73,7 +94,33 @@ const geEnterLimiter = rateLimit({
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: rlSkip(),
 });
+
+// ── Targeted limiters for money & state-mutating routes ───────────────────
+// Keyed by the AUTHENTICATED WALLET (falling back to IP) so one account can't
+// spam payouts/purchases from rotating IPs, and shared-NAT players aren't
+// throttled as a group. Placed AFTER requireAuth so req.auth.wallet is set.
+const tooMany = (_req, res) =>
+  res.status(429).json({ error: "Too many requests — slow down and try again shortly." });
+const byWallet = (req) =>
+  req.auth?.wallet ? `w:${req.auth.wallet}` : `ip:${req.ip}`;
+const mkLimiter = (max, keyGenerator) =>
+  rateLimit({
+    windowMs: 60_000,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: tooMany,
+    skip: rlSkip(),
+    ...(keyGenerator ? { keyGenerator } : {}),
+  });
+const payoutLimiter    = mkLimiter(12, byWallet); // SOL leaving the system (claims, arena withdraw)
+const purchaseLimiter  = mkLimiter(30, byWallet); // buy/confirm eggs & spaceships
+const marketLimiter    = mkLimiter(40, byWallet); // marketplace list/unlist/buy/confirm
+const arenaLimiter     = mkLimiter(40, byWallet); // arena deposit/confirm/topup
+const inventoryLimiter = mkLimiter(60, byWallet); // assign/unassign slot, register
+const readLimiter      = mkLimiter(240, null);    // public reads hitting ext. APIs / scrapable
 
 // CORS: use explicit allow-list (no wildcard strings).
 // Set FRONTEND_ORIGINS as comma-separated list (e.g. "https://app.example.com,https://staging.example.com")
@@ -86,6 +133,18 @@ function isAllowedOrigin(origin) {
   if (!origin) return true; // server-to-server or curl
   // Always allow localhost during dev
   if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return true;
+  // Allow private LAN IPs during dev (e.g. testing on a phone over WiFi)
+  if (
+    process.env.NODE_ENV !== "production" &&
+    /^https?:\/\/(?:10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)(?::\d+)?$/.test(origin)
+  )
+    return true;
+  // Allow Cloudflare quick-tunnel origins during dev (HTTPS testing on a phone)
+  if (
+    process.env.NODE_ENV !== "production" &&
+    /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(origin)
+  )
+    return true;
   if (FRONTEND_ORIGINS.includes(origin)) return true;
   return false;
 }
@@ -110,9 +169,39 @@ app.use("/static", express.static(path.join(__dirname, "public")));
 // Allow frontend to load images through Next.js /api rewrite (tunnel-friendly)
 app.use("/api/static", express.static(path.join(__dirname, "public")));
 
+// NFT metadata endpoint — used as the on-chain URI so wallets can fetch it
+app.get("/nft/metadata/:alienId/:tier", (req, res) => {
+  const { buildAlienMetadata } = require("./nft/metadata");
+  const alienId = parseInt(req.params.alienId, 10);
+  const tier = req.params.tier;
+  const validTiers = ["Common", "Rare", "Epic", "Legendary"];
+  if (isNaN(alienId) || alienId < 1 || !validTiers.includes(tier)) {
+    return res.status(400).json({ error: "invalid params" });
+  }
+  const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
+  res.json(buildAlienMetadata(alienId, tier, base));
+});
+
 const ADMIN_WALLET = process.env.ADMIN_WALLET;
 const DEV_WALLET_SECRET_KEY = process.env.DEV_WALLET_SECRET_KEY;
 const RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
+const DEV_SKIP_SOL_VERIFY = process.env.DEV_SKIP_SOL_VERIFY === "1";
+
+// Dev-only flags must never reach production: guest auth allows wallet
+// impersonation and skip-verify makes purchases free.
+if ((process.env.NODE_ENV || "development") === "production") {
+  if (process.env.DEV_GUEST_AUTH === "1" || DEV_SKIP_SOL_VERIFY) {
+    console.error("❌ DEV_GUEST_AUTH / DEV_SKIP_SOL_VERIFY are set in production. Refusing to start.");
+    process.exit(1);
+  }
+  if (!process.env.SERVER_HMAC_SECRET) {
+    console.error("❌ SERVER_HMAC_SECRET is not set. Refusing to start.");
+    process.exit(1);
+  }
+} else if (!process.env.SERVER_HMAC_SECRET) {
+  process.env.SERVER_HMAC_SECRET = crypto.randomBytes(32).toString("hex");
+  console.warn("⚠️  SERVER_HMAC_SECRET not set. Generated a temporary dev secret.");
+}
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || "";
 
 // Claim cooldown (default: 24h)
@@ -256,7 +345,8 @@ const DAILY_REWARD = {
 // ======= Weighted random =======
 function weightedPick(weights) {
   const total = Object.values(weights).reduce((a, b) => a + b, 0);
-  let r = Math.random() * total;
+  // crypto-grade randomness: hatch odds are worth real money
+  let r = (crypto.randomInt(0, 1_000_000) / 1_000_000) * total;
   for (const [tier, w] of Object.entries(weights)) {
     if (r < w) return tier;
     r -= w;
@@ -316,7 +406,13 @@ function parseSecretKeyBytes(secret) {
   }
 
   // base58-encoded secretKey bytes
-  return bs58.decode(trimmed);
+  try { return bs58.decode(trimmed); } catch {}
+
+  // base64-encoded secretKey bytes (fallback)
+  const b64 = Buffer.from(trimmed, "base64");
+  if (b64.length === 64) return Uint8Array.from(b64);
+
+  throw new Error("DEV_WALLET_SECRET_KEY: unrecognised format (expected JSON array, base58, or base64)");
 }
 
 let _devKeypair = null;
@@ -569,10 +665,10 @@ app.get("/api/rewards/:wallet", requireAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("GET /api/rewards error", e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
-app.post("/api/claim-rewards", requireAuth, async (req, res) => {
+app.post("/api/claim-rewards", requireAuth, payoutLimiter, async (req, res) => {
   try {
     const { expected_earnings } = req.body || {};
     const wallet = req.auth?.wallet;
@@ -693,12 +789,12 @@ app.post("/api/claim-rewards", requireAuth, async (req, res) => {
     }
   } catch (e) {
     console.error("POST /api/claim-rewards error", e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // --- Claim payouts (server sends SOL from DEV wallet) ---
-app.post("/api/claim-sol-intent", requireAuth, async (req, res) => {
+app.post("/api/claim-sol-intent", requireAuth, payoutLimiter, async (req, res) => {
   try {
     const { expected_earnings } = req.body || {};
     const wallet = req.auth?.wallet;
@@ -789,11 +885,11 @@ app.post("/api/claim-sol-intent", requireAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("POST /api/claim-sol-intent error", e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.post("/api/confirm-claim-sol", requireAuth, async (req, res) => {
+app.post("/api/confirm-claim-sol", requireAuth, payoutLimiter, async (req, res) => {
   try {
     const { intentId } = req.body || {};
     const wallet = req.auth?.wallet;
@@ -820,31 +916,57 @@ app.post("/api/confirm-claim-sol", requireAuth, async (req, res) => {
     if (!Number.isFinite(lamports) || lamports <= 0) {
       return res.status(400).json({ error: "invalid lamports" });
     }
+    // Hard safety cap on a single payout from the dev wallet.
+    const maxClaimLamports = Math.round(Number(process.env.MAX_CLAIM_SOL || 5) * 1e9);
+    if (lamports > maxClaimLamports) {
+      return res.status(400).json({ error: "Claim exceeds per-claim cap. Contact support." });
+    }
 
-    // Perform on-chain payout first, then finalize accounting in DB.
-    const signature = await sendSolPayout({ rpcUrl: RPC_URL, toPubkey: wallet, lamports });
-
+    // Reserve the claim BEFORE paying out:
+    //  - claim this intent atomically (pending -> processing) so a concurrent
+    //    confirm with the same intent can't double-pay
+    //  - re-check the cooldown against users.last_claim_at so a second intent
+    //    created before the first confirm can't be cashed too
+    //  - cancel any other pending intents for this wallet
+    const now = new Date();
     await query("BEGIN");
     try {
-      const now = new Date();
-
-      // Mark intent paid (idempotency guard)
-      await query(
-        `UPDATE claim_intents
-         SET status='paid', tx_signature=$1, paid_at=$2
-         WHERE id=$3`,
-        [signature, now, intentId]
+      const claimed = await query(
+        `UPDATE claim_intents SET status='processing'
+         WHERE id=$1 AND status='pending'
+         RETURNING id`,
+        [intentId]
       );
+      if (claimed.rowCount === 0) {
+        await query("ROLLBACK");
+        return res.status(409).json({ error: "Claim already in progress or paid" });
+      }
 
-      // Advance claim state (claim-all)
-      await query(
+      const cooldownCutoff = new Date(now.getTime() - CLAIM_COOLDOWN_MS);
+      const advanced = await query(
         `UPDATE users
          SET total_claimed_points = COALESCE(total_claimed_points, 0) + $1,
              pending_earnings = 0,
              last_claim_at = $2,
              last_accrual_at = $2
-         WHERE wallet = $3`,
-        [Number(intent.earnings_usd), now, wallet]
+         WHERE wallet = $3
+           AND (last_claim_at IS NULL OR last_claim_at <= $4)
+         RETURNING wallet`,
+        [Number(intent.earnings_usd), now, wallet, cooldownCutoff]
+      );
+      if (advanced.rowCount === 0) {
+        await query(
+          `UPDATE claim_intents SET status='cancelled' WHERE id=$1`,
+          [intentId]
+        );
+        await query("COMMIT");
+        return res.status(429).json({ error: "Claim cooldown" });
+      }
+
+      await query(
+        `UPDATE claim_intents SET status='cancelled'
+         WHERE wallet=$1 AND status='pending' AND id <> $2`,
+        [wallet, intentId]
       );
 
       await query("COMMIT");
@@ -853,10 +975,41 @@ app.post("/api/confirm-claim-sol", requireAuth, async (req, res) => {
       throw e;
     }
 
+    // Pay out on-chain. The claim is already reserved, so a crash here can't
+    // be exploited for a double payout.
+    let signature;
+    try {
+      signature = await sendSolPayout({ rpcUrl: RPC_URL, toPubkey: wallet, lamports });
+    } catch (e) {
+      // Payout failed: restore the user's earnings so nothing is lost, and mark
+      // the intent failed. We intentionally do NOT auto-retry — if the tx
+      // actually landed despite the error, a retry would double-pay.
+      console.error("sendSolPayout failed for intent", intentId, e);
+      await query(
+        `UPDATE claim_intents SET status='failed' WHERE id=$1`,
+        [intentId]
+      ).catch(() => {});
+      await query(
+        `UPDATE users
+         SET pending_earnings = COALESCE(pending_earnings, 0) + $1,
+             total_claimed_points = COALESCE(total_claimed_points, 0) - $1
+         WHERE wallet = $2`,
+        [Number(intent.earnings_usd), wallet]
+      ).catch(() => {});
+      return res.status(502).json({ error: "Payout failed. Your earnings were restored — try again later." });
+    }
+
+    await query(
+      `UPDATE claim_intents
+       SET status='paid', tx_signature=$1, paid_at=$2
+       WHERE id=$3`,
+      [signature, new Date(), intentId]
+    );
+
     return res.json({ ok: true, signature });
   } catch (e) {
     console.error("POST /api/confirm-claim-sol error", e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -866,12 +1019,12 @@ app.get("/api/health", (_, res) => {
 });
 
 // Price helper (used by frontend to show SOL/USD quote without creating an intent)
-app.get("/api/price/sol-usd", async (_req, res) => {
+app.get("/api/price/sol-usd", readLimiter, async (_req, res) => {
   try {
     const { solUsd, source } = await getSolUsdPrice();
     res.json({ ok: true, solUsd, source, ts: Date.now() });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: "Internal server error" });
   }
 });
 
@@ -925,7 +1078,7 @@ app.post("/api/auth/verify", authVerifyLimiter, async (req, res) => {
     nonces.delete(wallet);
     await query(`DELETE FROM auth_nonces WHERE wallet=$1`, [wallet]);
 
-    const token = jwt.sign({ wallet }, JWT_SECRET, { expiresIn: "12h" });
+    const token = jwt.sign({ wallet }, JWT_SECRET, { expiresIn: "7d" });
     return res.json({ token, wallet, expires_in: "12h" });
   } catch (e) {
     return res.status(400).json({ error: "Bad signature format" });
@@ -961,7 +1114,12 @@ app.get("/api/aliens/:wallet", async (req, res) => {
   try {
     const { wallet } = req.params;
     const result = await query(
-      `SELECT * FROM aliens WHERE wallet = $1 ORDER BY id DESC`,
+      `SELECT * FROM aliens WHERE wallet = $1
+         AND id NOT IN (
+           SELECT alien_db_id FROM marketplace_listings
+           WHERE status IN ('active','pending_escrow')
+         )
+       ORDER BY id DESC`,
       [wallet]
     );
 
@@ -975,7 +1133,7 @@ app.get("/api/aliens/:wallet", async (req, res) => {
     res.json(normalized);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 app.get("/api/ship/:wallet", async (req, res) => {
@@ -1025,13 +1183,13 @@ app.get("/api/ship/:wallet", async (req, res) => {
     });
   } catch (e) {
     console.log(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // Legacy endpoint (kept for compatibility): only allow the authenticated user to upgrade their own ship.
 // NOTE: Real upgrades should go through the paid flow + /confirm-buy-spaceship.
-app.post("/api/upgrade-ship", requireAuth, async (req, res) => {
+app.post("/api/upgrade-ship", requireAuth, upgradeWithItemsLimiter, async (req, res) => {
   const { newLevel } = req.body || {};
   const wallet = req.auth?.wallet;
 
@@ -1052,11 +1210,11 @@ app.post("/api/upgrade-ship", requireAuth, async (req, res) => {
     res.json({ ok: true, level: lvl });
   } catch (e) {
     console.log(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.post("/api/assign-slot", requireAuth, async (req, res) => {
+app.post("/api/assign-slot", requireAuth, inventoryLimiter, async (req, res) => {
   const { slotIndex, alienDbId } = req.body || {};
   const wallet = req.auth?.wallet;
 
@@ -1129,10 +1287,10 @@ app.post("/api/assign-slot", requireAuth, async (req, res) => {
   } catch (e) {
     await query("ROLLBACK").catch(() => {});
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
-app.post("/api/unassign-slot", requireAuth, async (req, res) => {
+app.post("/api/unassign-slot", requireAuth, inventoryLimiter, async (req, res) => {
   const { alienDbId } = req.body || {};
   const wallet = req.auth?.wallet;
 
@@ -1198,11 +1356,11 @@ app.post("/api/unassign-slot", requireAuth, async (req, res) => {
   } catch (e) {
     await query("ROLLBACK").catch(() => {});
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.post("/api/register", requireAuth, async (req, res) => {
+app.post("/api/register", requireAuth, inventoryLimiter, async (req, res) => {
   const wallet = req.auth?.wallet;
   if (!wallet) return res.status(401).json({ error: "Unauthorized" });
 
@@ -1217,7 +1375,7 @@ app.post("/api/register", requireAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -1260,7 +1418,7 @@ app.get("/api/expedition/status", requireAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("GET /api/expedition/status error", e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -1328,7 +1486,7 @@ app.post("/api/expedition/start", expeditionStartLimiter, requireAuth, async (re
     }
   } catch (e) {
     console.error("POST /api/expedition/start error", e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -1342,23 +1500,19 @@ app.post("/api/spin", requireAuth, limitSpin, async (req, res) => {
   const col = eggColumn(eggType);
   if (!col) return res.status(400).json({ error: "Invalid eggType" });
 
-  const credits = await query(`SELECT ${col} FROM users WHERE wallet = $1`, [
-    wallet,
-  ]);
-  const count = Number(credits.rows[0]?.[col] ?? 0);
-  if (count <= 0) {
+  // Atomic check-and-decrement: the WHERE ${col} > 0 guard means two concurrent
+  // spins with one credit can't both succeed.
+  const spent = await query(
+    `UPDATE users SET ${col} = ${col} - 1 WHERE wallet = $1 AND ${col} > 0 RETURNING ${col}`,
+    [wallet]
+  );
+  if (spent.rowCount === 0) {
     return res.status(402).json({
       error: "No egg credits",
       eggType,
       message: "Buy an egg first.",
     });
   }
-
-  // Decrement credit immediately (best-effort). If we crash mid-spin, user lost 1 credit;
-  // in production we'd wrap purchase/spin in a stronger transaction model.
-  await query(`UPDATE users SET ${col} = GREATEST(${col} - 1, 0) WHERE wallet = $1`, [
-    wallet,
-  ]);
 
   // Apply egg modifiers
   const mod = EGG_MOD[eggType] || EGG_MOD.basic;
@@ -1402,7 +1556,7 @@ app.post("/api/spin", requireAuth, limitSpin, async (req, res) => {
   }
 
   // Normal case: real alien stored in DB and appears in hangar
-  const randId = 1 + Math.floor(Math.random() * ALIEN_COUNT);
+  const randId = 1 + crypto.randomInt(0, ALIEN_COUNT);
   const alien = { id: randId, image: imgUrl(req, randId) };
 
   const payload = { ...basePayload, alien };
@@ -1419,9 +1573,25 @@ app.post("/api/spin", requireAuth, limitSpin, async (req, res) => {
     [wallet, randId, alien.image, tier, roi]
   );
 
+  const dbId = result.rows[0].id;
+
+  // Mint NFT fire-and-forget — never blocks or fails the spin response.
+  if (process.env.NFT_MINT_ENABLED === "1") {
+    setImmediate(async () => {
+      try {
+        const kp = getDevKeypair();
+        const mintAddress = await mintAlienNft(kp, randId, tier, wallet);
+        await query(`UPDATE aliens SET nft_mint = $1 WHERE id = $2`, [mintAddress, dbId]);
+        console.log(`[NFT] alien db#${dbId} → mint ${mintAddress}`);
+      } catch (e) {
+        console.warn(`[NFT] mint failed for alien db#${dbId}:`, e.message);
+      }
+    });
+  }
+
   res.json({
     ...payload,
-    db_id: result.rows[0].id,
+    db_id: dbId,
     serverSignature: signature,
   });
 });
@@ -1430,7 +1600,7 @@ app.post("/api/spin", requireAuth, limitSpin, async (req, res) => {
 
 // --- Payments API (devnet) ---
 // Prepare a SOL transfer tx for an egg purchase
-app.post("/api/buy-egg", requireAuth, async (req, res) => {
+app.post("/api/buy-egg", requireAuth, purchaseLimiter, async (req, res) => {
   try {
     const { eggType = "basic" } = req.body || {};
     const wallet = req.auth?.wallet;
@@ -1451,6 +1621,22 @@ app.post("/api/buy-egg", requireAuth, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [intentId, wallet, `buy_egg:${eggType}`, priceUsd, solUsd, String(lamports), expiresAt]
     );
+
+    if (DEV_SKIP_SOL_VERIFY) {
+      return res.json({
+        serialized: null,
+        devSkip: true,
+        intentId,
+        amountSol,
+        lamports,
+        solUsd,
+        solUsdSource: source,
+        admin: ADMIN_WALLET || "dev",
+        eggType,
+        priceUsd,
+        expiresAt: expiresAt.toISOString(),
+      });
+    }
 
     const admin = new PublicKey(ADMIN_WALLET);
     const tx = await buildTransferTx({
@@ -1478,12 +1664,12 @@ app.post("/api/buy-egg", requireAuth, async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // Confirm a signed payment and credit the egg
-app.post("/api/confirm-buy-egg", requireAuth, async (req, res) => {
+app.post("/api/confirm-buy-egg", requireAuth, purchaseLimiter, async (req, res) => {
   try {
     const { eggType = "basic", signature, intentId } = req.body || {};
     const wallet = req.auth?.wallet;
@@ -1510,22 +1696,24 @@ app.post("/api/confirm-buy-egg", requireAuth, async (req, res) => {
     const minLamports = Number(row.lamports);
     const amountSol = lamportsToSol(minLamports);
 
-    // Prevent replay
-    const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [signature]);
-    if (already.rowCount > 0) {
-      return res.status(409).json({ error: "payment already processed" });
-    }
+    if (!DEV_SKIP_SOL_VERIFY) {
+      // Prevent replay
+      const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [signature]);
+      if (already.rowCount > 0) {
+        return res.status(409).json({ error: "payment already processed" });
+      }
 
-    const verify = await verifySolPayment({
-      rpcUrl: RPC_URL,
-      signature,
-      expectedFrom: wallet,
-      expectedTo: ADMIN_WALLET,
-      minLamports,
-    });
+      const verify = await verifySolPayment({
+        rpcUrl: RPC_URL,
+        signature,
+        expectedFrom: wallet,
+        expectedTo: ADMIN_WALLET,
+        minLamports,
+      });
 
-    if (!verify.ok) {
-      return res.status(400).json({ error: "invalid payment", detail: verify });
+      if (!verify.ok) {
+        return res.status(400).json({ error: "invalid payment", detail: verify });
+      }
     }
 
     // Ensure user exists
@@ -1570,12 +1758,12 @@ app.post("/api/confirm-buy-egg", requireAuth, async (req, res) => {
     res.json({ ok: true, eggType, credited: 1, signature, amountSol });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // Prepare a SOL transfer tx for a ship purchase
-app.post("/api/buy-spaceship", requireAuth, async (req, res) => {
+app.post("/api/buy-spaceship", requireAuth, purchaseLimiter, async (req, res) => {
   try {
     const { level } = req.body || {};
     const wallet = req.auth?.wallet;
@@ -1596,6 +1784,22 @@ app.post("/api/buy-spaceship", requireAuth, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [intentId, wallet, `buy_ship:${level}`, priceUsd, solUsd, String(lamports), expiresAt]
     );
+
+    if (DEV_SKIP_SOL_VERIFY) {
+      return res.json({
+        serialized: null,
+        devSkip: true,
+        intentId,
+        amountSol,
+        lamports,
+        solUsd,
+        solUsdSource: source,
+        admin: ADMIN_WALLET || "dev",
+        level,
+        priceUsd,
+        expiresAt: expiresAt.toISOString(),
+      });
+    }
 
     const admin = new PublicKey(ADMIN_WALLET);
     const tx = await buildTransferTx({
@@ -1623,12 +1827,12 @@ app.post("/api/buy-spaceship", requireAuth, async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // Confirm ship payment and set ship_level
-app.post("/api/confirm-buy-spaceship", requireAuth, async (req, res) => {
+app.post("/api/confirm-buy-spaceship", requireAuth, purchaseLimiter, async (req, res) => {
   try {
     const { level, signature, intentId } = req.body || {};
     const wallet = req.auth?.wallet;
@@ -1654,21 +1858,23 @@ app.post("/api/confirm-buy-spaceship", requireAuth, async (req, res) => {
     const minLamports = Number(row.lamports);
     const amountSol = lamportsToSol(minLamports);
 
-    const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [signature]);
-    if (already.rowCount > 0) {
-      return res.status(409).json({ error: "payment already processed" });
-    }
+    if (!DEV_SKIP_SOL_VERIFY) {
+      const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [signature]);
+      if (already.rowCount > 0) {
+        return res.status(409).json({ error: "payment already processed" });
+      }
 
-    const verify = await verifySolPayment({
-      rpcUrl: RPC_URL,
-      signature,
-      expectedFrom: wallet,
-      expectedTo: ADMIN_WALLET,
-      minLamports,
-    });
+      const verify = await verifySolPayment({
+        rpcUrl: RPC_URL,
+        signature,
+        expectedFrom: wallet,
+        expectedTo: ADMIN_WALLET,
+        minLamports,
+      });
 
-    if (!verify.ok) {
-      return res.status(400).json({ error: "invalid payment", detail: verify });
+      if (!verify.ok) {
+        return res.status(400).json({ error: "invalid payment", detail: verify });
+      }
     }
 
     await query(
@@ -1708,7 +1914,7 @@ app.post("/api/confirm-buy-spaceship", requireAuth, async (req, res) => {
     res.json({ ok: true, level: Number(level), signature });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -1719,7 +1925,10 @@ const GE_SHIPS = 15;
 const GE_ADMIN_KEY = process.env.GE_ADMIN_KEY || "";
 const GE_TREASURY_WALLET = process.env.GE_TREASURY_WALLET || ADMIN_WALLET;
 
-const GE_GAME_MODES = ["roulette", "elimination", "race"]; // rotate per round
+// Simplified to a single, polished mode by default. Set
+// GE_GAME_MODES="roulette,race,elimination" to rotate modes again.
+const GE_GAME_MODES = (process.env.GE_GAME_MODES || "roulette")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 function pickGameMode(nextRoundId) {
   // deterministic rotation (shared across all clients)
   return GE_GAME_MODES[(Number(nextRoundId || 0) - 1) % GE_GAME_MODES.length] || "roulette";
@@ -1741,15 +1950,22 @@ function genUniqueAlienIds(n) {
 
 // Tokenomics (recommended defaults)
 const GE_ENTRY_PRICE_SOL = Number(process.env.GE_ENTRY_PRICE_SOL || 0.1); // min 0.1 SOL per entry
-// Payout split (bps)
-const GE_WINNER_BPS = Number(process.env.GE_WINNER_BPS || 7000);
-const GE_PARTICIPATION_BPS = Number(process.env.GE_PARTICIPATION_BPS || 2500);
+// Payout split (bps). Winner-take-all: the wallets that picked the winning ship
+// split the WHOLE pot (their own stakes + every loser's stake) minus a small
+// house rake. Losers forfeit their stake — no consolation/participation payout.
+// For a literal 100% to winners, set GE_WINNER_BPS=10000 and GE_TREASURY_BPS=0.
+const GE_WINNER_BPS = Number(process.env.GE_WINNER_BPS || 9500);
+const GE_PARTICIPATION_BPS = Number(process.env.GE_PARTICIPATION_BPS || 0);
 const GE_TREASURY_BPS = Number(process.env.GE_TREASURY_BPS || 500);
 
 function requireAdmin(req, res, next) {
   if (!GE_ADMIN_KEY) return res.status(500).json({ error: "Server misconfigured (GE_ADMIN_KEY missing)" });
-  const k = req.headers["x-admin-key"];
-  if (k !== GE_ADMIN_KEY) return res.status(403).json({ error: "Forbidden" });
+  const a = Buffer.from(String(req.headers["x-admin-key"] || ""));
+  const b = Buffer.from(GE_ADMIN_KEY);
+  // timingSafeEqual prevents timing side-channels on the admin key
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
   return next();
 }
 
@@ -1761,10 +1977,11 @@ async function getCurrentRound() {
   return r.rows[0] || null;
 }
 
-async function getRoundStats(roundId) {
+async function getRoundStats(roundId, { excludeBots = false } = {}) {
   const totals = await query(
     `SELECT ship_index, COALESCE(SUM(qty),0) AS qty
      FROM ge_entries WHERE round_id=$1
+     ${excludeBots ? `AND wallet NOT LIKE 'bot-%'` : ""}
      GROUP BY ship_index
      ORDER BY ship_index`,
     [roundId]
@@ -1776,6 +1993,25 @@ async function getRoundStats(roundId) {
   }
   const totalEntries = perShip.reduce((a, b) => a + b.qty, 0);
   return { perShip, totalEntries };
+}
+
+// Lobby -> running. A round is created as 'filling' with no countdown and waits
+// for players. The first REAL (paying) entry starts the clock. This prevents
+// pointless empty rounds from spinning + settling when nobody is playing.
+async function maybeStartRound(roundId) {
+  const cur = await query(`SELECT * FROM ge_rounds WHERE id=$1`, [roundId]);
+  const r = cur.rows[0];
+  if (!r || r.status !== "filling") return r || null;
+  const real = await getRoundStats(roundId, { excludeBots: true });
+  if (real.totalEntries <= 0) return r; // still waiting for players
+  const DURATION_MINUTES = Number(process.env.GE_ROUND_MINUTES || 10);
+  const endsAt = new Date(Date.now() + DURATION_MINUTES * 60 * 1000);
+  const upd = await query(
+    `UPDATE ge_rounds SET status='running', started_at=NOW(), ends_at=$2
+     WHERE id=$1 AND status='filling' RETURNING *`,
+    [roundId, endsAt]
+  );
+  return upd.rows[0] || r;
 }
 
 app.get("/api/v2/ge/round/current", async (_req, res) => {
@@ -1799,9 +2035,8 @@ app.get("/api/v2/ge/round/current", async (_req, res) => {
   }
 
   if (!round) {
-    const DURATION_MINUTES = Number(process.env.GE_ROUND_MINUTES || 10);
-    const endsAt = new Date(Date.now() + DURATION_MINUTES * 60 * 1000);
-
+    // Create a LOBBY round: status 'filling', NO countdown (started_at/ends_at
+    // null). It waits here until a real player enters — no empty rounds spinning.
     const secret = crypto.randomBytes(32).toString("hex");
     const commit = crypto.createHash("sha256").update(secret).digest("hex");
 
@@ -1809,14 +2044,19 @@ app.get("/api/v2/ge/round/current", async (_req, res) => {
 
     const r = await query(
       `INSERT INTO ge_rounds (status, ends_at, ships_count, emissions_total, started_at, seed_commit, seed_reveal, alien_ids, game_mode)
-       VALUES ('running', $1, $2, 0, NOW(), $3, $4, $5, NULL)
+       VALUES ('filling', NULL, $1, 0, NULL, $2, $3, $4, NULL)
        RETURNING *`,
-      [endsAt, GE_SHIPS, commit, secret, JSON.stringify(aliens)]
+      [GE_SHIPS, commit, secret, JSON.stringify(aliens)]
     );
     const created = r.rows[0];
     const mode = pickGameMode(created.id);
     await query(`UPDATE ge_rounds SET game_mode=$2 WHERE id=$1`, [created.id, mode]);
     round = { ...created, game_mode: mode };
+  }
+
+  // Lobby -> running: start the countdown only once a real entry exists.
+  if (round.status === "filling") {
+    round = await maybeStartRound(round.id);
   }
 
   // Auto-settle when ended (dev-friendly). This makes the UI announce results
@@ -1832,7 +2072,12 @@ app.get("/api/v2/ge/round/current", async (_req, res) => {
     round = await getCurrentRound();
   }
 
-  const stats = await getRoundStats(round.id);
+  // Report the REAL (payable) pot/odds — exclude simulator bots. settleRound and
+  // the settled-summary endpoint already use real entries only, so this keeps the
+  // displayed pool + per-ship odds consistent with what actually gets paid out.
+  // (Before: the live pool included bot "SOL" nobody deposited, so a winner saw a
+  // big pool but was credited only the real pot — looked like payouts were broken.)
+  const stats = await getRoundStats(round.id, { excludeBots: true });
   return res.json({
     ok: true,
     round: {
@@ -1892,7 +2137,8 @@ app.post("/api/v2/ge/buy-entry", geEnterLimiter, requireAuth, async (req, res) =
     }
 
     const round = await getCurrentRound();
-    if (!round || round.status !== "running") return res.status(400).json({ error: "No running round" });
+    if (!round || !["filling", "running"].includes(round.status))
+      return res.status(400).json({ error: "No open round" });
 
     const shipIndex = Number(req.body?.ship_index);
     const qty = Math.max(1, Math.min(100, Number(req.body?.qty || 1)));
@@ -1943,7 +2189,7 @@ app.post("/api/v2/ge/buy-entry", geEnterLimiter, requireAuth, async (req, res) =
     });
   } catch (e) {
     console.error("POST /api/v2/ge/buy-entry error", e);
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -1993,10 +2239,13 @@ app.post("/api/v2/ge/confirm-entry", geEnterLimiter, requireAuth, async (req, re
     // Check round is still running
     const round = await query(`SELECT * FROM ge_rounds WHERE id=$1`, [roundId]);
     const r = round.rows[0];
-    if (!r || r.status !== "running") return res.status(400).json({ error: "round not running" });
+    if (!r || !["filling", "running"].includes(r.status))
+      return res.status(400).json({ error: "round not open" });
 
     const cutoffMs = Number(process.env.GE_ENTRY_CUTOFF_MS || 15000);
-    if (Date.now() > new Date(r.ends_at).getTime() - cutoffMs) {
+    // Only enforce the entry cutoff once the countdown has started; a 'filling'
+    // lobby round has no ends_at yet.
+    if (r.started_at && r.ends_at && Date.now() > new Date(r.ends_at).getTime() - cutoffMs) {
       return res.status(400).json({ error: "Round entry closed" });
     }
 
@@ -2029,16 +2278,24 @@ app.post("/api/v2/ge/confirm-entry", geEnterLimiter, requireAuth, async (req, re
       throw e;
     }
 
-    const stats = await getRoundStats(roundId);
+    // First real entry starts the lobby countdown (no empty rounds).
+    await maybeStartRound(roundId);
+
+    const stats = await getRoundStats(roundId, { excludeBots: true });
     return res.json({ ok: true, round_id: roundId, stats });
   } catch (e) {
     console.error("POST /api/v2/ge/confirm-entry error", e);
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
 app.post("/api/v2/ge/enter", geEnterLimiter, requireAuth, async (req, res) => {
   try {
+    // Free entries are a dev/guest testing path ONLY. With real SOL payouts,
+    // an open free-entry route is a money faucet.
+    if (process.env.DEV_GUEST_AUTH !== "1") {
+      return res.status(403).json({ error: "Free entries disabled. Use /buy-entry." });
+    }
     const wallet = req.auth?.wallet;
     const round = await getCurrentRound();
     if (!round) return res.status(400).json({ error: "No open round" });
@@ -2063,9 +2320,9 @@ app.post("/api/v2/ge/enter", geEnterLimiter, requireAuth, async (req, res) => {
       [round.id, wallet, shipIndex, qty]
     );
 
-    const stats = await getRoundStats(round.id);
-
-    // Note: rounds are created as running in dev; no auto-start needed here.
+    // First entry starts the lobby countdown (no empty rounds).
+    await maybeStartRound(round.id);
+    const stats = await getRoundStats(round.id, { excludeBots: true });
 
     // Enforce state: once running ends, no more entries.
     // (We keep it strict to prevent last-millisecond sniping.)
@@ -2077,7 +2334,7 @@ app.post("/api/v2/ge/enter", geEnterLimiter, requireAuth, async (req, res) => {
     return res.json({ ok: true, round_id: round.id, stats });
   } catch (e) {
     console.error("POST /api/v2/ge/enter error", e);
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -2109,7 +2366,7 @@ app.post("/api/v2/ge/admin/create-round", requireAdmin, async (req, res) => {
     return res.json({ ok: true, round: { ...created, game_mode: mode } });
   } catch (e) {
     console.error("POST /api/v2/ge/admin/create-round error", e);
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -2126,6 +2383,12 @@ async function settleRound(round) {
   }
 
   const stats = await getRoundStats(round.id);
+
+  // ECONOMICS: simulator bots (wallet 'bot-…') never deposit SOL. They exist for
+  // liveliness only, so the pot and ALL payout math use real (paying) entries.
+  // Including bots here would mint phantom SOL the treasury never received.
+  const realStats = await getRoundStats(round.id, { excludeBots: true });
+
   // Commit–reveal style seed: round has a secret (seed_reveal) stored server-side.
   // We never expose seed_reveal; clients may see seed_commit for audit.
   const secret = round.seed_reveal || crypto.randomBytes(32).toString("hex");
@@ -2134,14 +2397,16 @@ async function settleRound(round) {
     .update(`${secret}:${round.id}:${endsAt.toISOString()}:${stats.totalEntries}`)
     .digest("hex");
 
-  // Winner selection: weighted by entries (tickets), not by ship.
-  // This makes P(win ship i) proportional to entries on that ship.
+  // Winner selection: weighted by REAL entries (tickets) so bot stakes can't
+  // skew real players' odds. If only bots played, fall back to all entries
+  // (purely cosmetic — pot is 0).
+  const weightStats = realStats.totalEntries > 0 ? realStats : stats;
   let winningShip = 0;
-  if (stats.totalEntries > 0) {
-    const ticket = parseInt(seed.slice(0, 12), 16) % stats.totalEntries;
+  if (weightStats.totalEntries > 0) {
+    const ticket = parseInt(seed.slice(0, 12), 16) % weightStats.totalEntries;
     let acc = 0;
     for (let i = 0; i < GE_SHIPS; i++) {
-      acc += Number(stats.perShip[i]?.qty || 0);
+      acc += Number(weightStats.perShip[i]?.qty || 0);
       if (ticket < acc) {
         winningShip = i;
         break;
@@ -2149,28 +2414,28 @@ async function settleRound(round) {
     }
   }
 
-  const potSol = Number(stats.totalEntries) * GE_ENTRY_PRICE_SOL;
+  const potSol = Number(realStats.totalEntries) * GE_ENTRY_PRICE_SOL;
   const emissionsTotal = potSol;
 
   const treasuryCut = (potSol * GE_TREASURY_BPS) / 10000;
   const winnerPot = (potSol * GE_WINNER_BPS) / 10000;
   const participationPot = (potSol * GE_PARTICIPATION_BPS) / 10000;
 
-  // Winners are wallets that picked winningShip; split pro-rata by qty on that ship.
+  // Winners are real wallets that picked winningShip; split pro-rata by qty on that ship.
   const winners = await query(
     `SELECT wallet, COALESCE(SUM(qty),0) AS qty
      FROM ge_entries
-     WHERE round_id=$1 AND ship_index=$2
+     WHERE round_id=$1 AND ship_index=$2 AND wallet NOT LIKE 'bot-%'
      GROUP BY wallet`,
     [round.id, winningShip]
   );
   const winTotalQty = winners.rows.reduce((a, r) => a + Number(r.qty), 0);
 
-  // Participation: all wallets split pro-rata by total entries (across all ships).
+  // Participation: all real wallets split pro-rata by total entries (across all ships).
   const participants = await query(
     `SELECT wallet, COALESCE(SUM(qty),0) AS qty
      FROM ge_entries
-     WHERE round_id=$1
+     WHERE round_id=$1 AND wallet NOT LIKE 'bot-%'
      GROUP BY wallet`,
     [round.id]
   );
@@ -2265,7 +2530,7 @@ app.post("/api/v2/ge/admin/settle", requireAdmin, async (req, res) => {
     return res.json(out);
   } catch (e) {
     console.error("POST /api/v2/ge/admin/settle error", e);
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -2280,7 +2545,7 @@ app.post("/api/v2/ge/round/heartbeat", requireAdmin, async (_req, res) => {
     }
     return res.json({ ok: true, round_id: round.id, status: round.status });
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -2291,7 +2556,7 @@ app.get("/api/v2/ge/balance", requireAuth, async (req, res) => {
     const bal = r.rowCount ? Number(r.rows[0].balance) : 0;
     res.json({ ok: true, wallet, balance: bal });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -2300,12 +2565,12 @@ app.get("/api/v2/ge/last", async (_req, res) => {
     const r = await query(`SELECT id, settled_at, winning_ship_index, emissions_total, seed, alien_ids, game_mode FROM ge_rounds WHERE status='settled' ORDER BY id DESC LIMIT 1`);
     res.json({ ok: true, last: r.rows[0] || null });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // Settled round summary (for winner modal / stats)
-app.get("/api/v2/ge/round/summary", async (_req, res) => {
+app.get("/api/v2/ge/round/summary", async (req, res) => {
   try {
     const roundIdParam = req.query.round_id ? Number(req.query.round_id) : null;
     const r = roundIdParam
@@ -2314,14 +2579,15 @@ app.get("/api/v2/ge/round/summary", async (_req, res) => {
     const round = r.rows[0];
     if (!round) return res.json({ ok: true, round: null });
 
-    const stats = await getRoundStats(round.id);
+    // Money figures must mirror settleRound: real (non-bot) entries only.
+    const stats = await getRoundStats(round.id, { excludeBots: true });
     const potSol = Number(stats.totalEntries) * GE_ENTRY_PRICE_SOL;
     const treasuryCut = (potSol * GE_TREASURY_BPS) / 10000;
     const winnerPot = (potSol * GE_WINNER_BPS) / 10000;
     const participationPot = (potSol * GE_PARTICIPATION_BPS) / 10000;
 
     const participantsCount = await query(
-      `SELECT COUNT(DISTINCT wallet) AS c FROM ge_entries WHERE round_id=$1`,
+      `SELECT COUNT(DISTINCT wallet) AS c FROM ge_entries WHERE round_id=$1 AND wallet NOT LIKE 'bot-%'`,
       [round.id]
     );
     const payoutsSum = await query(
@@ -2351,7 +2617,7 @@ app.get("/api/v2/ge/round/summary", async (_req, res) => {
       distributed_total: Number(payoutsSum.rows[0]?.s || 0),
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -2391,7 +2657,7 @@ app.get("/api/v2/ge/round/payouts", async (req, res) => {
       })),
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -2401,7 +2667,7 @@ function startGreatExpeditionSimulator() {
   console.log("🤖 GE simulator enabled");
 
   const simEnabled = !["0","false","off"].includes((process.env.GE_SIM_ENABLED || "").toLowerCase());
-  const intervalMs = Number(process.env.GE_SIM_INTERVAL_MS || 2500);
+  const intervalMs = Number(process.env.GE_SIM_INTERVAL_MS || 6000); // calmer default: bots are set dressing
   const maxBots = Number(process.env.GE_SIM_MAX_BOTS || GE_SHIPS);
 
   // lightweight "live action": bots place small entries on random ships while round is running.
@@ -2418,7 +2684,7 @@ function startGreatExpeditionSimulator() {
       if (Date.now() > new Date(round.ends_at).getTime() - cutoffMs) return;
 
       // decide number of actions this tick
-      const actions = 1 + crypto.randomInt(0, 3); // 1-3
+      const actions = 1 + crypto.randomInt(0, 2); // 1-2
 
       for (let a = 0; a < actions; a++) {
         const botId = crypto.randomInt(0, maxBots);
@@ -2440,9 +2706,536 @@ function startGreatExpeditionSimulator() {
   }
 }
 
+// ===================== MARKETPLACE =====================
+
+app.get("/api/marketplace/listings", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT ml.id, ml.seller_wallet, ml.alien_db_id, ml.alien_id,
+             ml.tier, ml.roi, ml.nft_mint, ml.price_sol, ml.listed_at
+      FROM marketplace_listings ml
+      WHERE ml.status = 'active'
+      ORDER BY ml.listed_at DESC
+      LIMIT 100
+    `);
+    res.json(rows.map(r => ({ ...r, image: imgUrl(req, r.alien_id) })));
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+app.get("/api/marketplace/my-listings", requireAuth, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const { rows } = await query(`
+      SELECT id, alien_db_id, alien_id, tier, roi, nft_mint, price_sol, listed_at, status
+      FROM marketplace_listings
+      WHERE seller_wallet = $1 AND status IN ('active','pending_escrow')
+      ORDER BY listed_at DESC
+    `, [wallet]);
+    res.json(rows.map(r => ({ ...r, image: imgUrl(req, r.alien_id) })));
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+// Public read of a wallet's own listings (active + pending_escrow). Lets "My
+// Listings" survive a page reload before the wallet has re-signed a JWT — this
+// data isn't sensitive (seller_wallet is already public in Browse).
+app.get("/api/marketplace/listings-by-seller", async (req, res) => {
+  try {
+    const wallet = String(req.query.wallet || "");
+    if (!wallet) return res.json([]);
+    const { rows } = await query(`
+      SELECT id, seller_wallet, alien_db_id, alien_id, tier, roi, nft_mint, price_sol, listed_at, status
+      FROM marketplace_listings
+      WHERE seller_wallet = $1 AND status IN ('active','pending_escrow')
+      ORDER BY listed_at DESC
+    `, [wallet]);
+    res.json(rows.map(r => ({ ...r, image: imgUrl(req, r.alien_id) })));
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+app.post("/api/marketplace/list", requireAuth, marketLimiter, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const { alienDbId, priceSol } = req.body || {};
+    const price = Number(priceSol);
+    if (!alienDbId || !Number.isFinite(price) || price < 0.001 || price > 100000)
+      return res.status(400).json({ error: "Price must be between 0.001 and 100000 SOL" });
+
+    const alienRow = await query(
+      `SELECT id, alien_id, tier, roi, nft_mint FROM aliens WHERE id = $1 AND wallet = $2`,
+      [alienDbId, wallet]
+    );
+    if (alienRow.rowCount === 0)
+      return res.status(403).json({ error: "alien not found or not yours" });
+    const alien = alienRow.rows[0];
+
+    // A failed/abandoned escrow attempt leaves a dead pending_escrow row
+    // (NFT never left the seller) — clear it so re-listing works.
+    await query(
+      `UPDATE marketplace_listings SET status='cancelled'
+       WHERE alien_db_id=$1 AND seller_wallet=$2 AND status='pending_escrow'`,
+      [alienDbId, wallet]
+    );
+
+    const existing = await query(
+      `SELECT id FROM marketplace_listings WHERE alien_db_id = $1 AND status IN ('active','pending_escrow')`,
+      [alienDbId]
+    );
+    if (existing.rowCount > 0)
+      return res.status(409).json({ error: "alien already listed" });
+
+    // On-chain escrow: minted aliens must be deposited with the admin wallet
+    // before the listing goes live. The seller signs the transfer client-side.
+    // BUT only if this wallet actually holds the NFT on-chain — pre-escrow
+    // marketplace sales moved DB ownership without moving the NFT, so those
+    // aliens (and ones minted elsewhere) fall back to a DB-only listing.
+    // On-chain escrow is REQUIRED in real-devnet mode: the NFT must be deposited
+    // with the admin (escrow) wallet before the listing goes live. We never
+    // silently fall back to a DB-only listing. (DEV_SKIP_SOL_VERIFY keeps DB-only
+    // for offline local testing.)
+    const canEscrow = !DEV_SKIP_SOL_VERIFY && !!ADMIN_WALLET;
+    if (canEscrow && !alien.nft_mint) {
+      return res.status(409).json({
+        error: "This alien isn't an on-chain NFT yet, so it can't be listed with blockchain escrow.",
+      });
+    }
+
+    // Best-effort holder check. On RPC errors we DON'T downgrade to DB-only — we
+    // trust the mint and let the signed transfer + confirm-list be the source of
+    // truth (a seller who doesn't hold the NFT can't sign a valid transfer).
+    let onchainOwner;
+    if (canEscrow) {
+      try {
+        const { getNftOwner } = require("./nft/escrow");
+        onchainOwner = await getNftOwner({ rpcUrl: RPC_URL, mint: alien.nft_mint });
+      } catch (e) {
+        console.warn("[escrow] owner pre-check skipped (RPC):", e.message);
+      }
+    }
+    if (onchainOwner && onchainOwner !== wallet && onchainOwner !== ADMIN_WALLET) {
+      return res.status(409).json({ error: "You don't hold this NFT on-chain — can't list it." });
+    }
+
+    // Already sitting in escrow from a previous attempt → the listing is live now.
+    const alreadyEscrowed = onchainOwner === ADMIN_WALLET;
+    const useEscrow = canEscrow && !alreadyEscrowed;
+    const status = canEscrow ? (alreadyEscrowed ? "active" : "pending_escrow") : "active";
+
+    const { rows } = await query(
+      `INSERT INTO marketplace_listings
+         (seller_wallet, alien_db_id, alien_id, tier, roi, nft_mint, price_sol, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [wallet, alienDbId, alien.alien_id, alien.tier, alien.roi, alien.nft_mint, price, status]
+    );
+    const listingId = rows[0].id;
+
+    // The alien is now escrowed/for sale — pull it out of any ship slot so it
+    // stops showing in the Colony hangar and can't be assigned.
+    await query(`DELETE FROM ship_slots WHERE alien_fk = $1`, [alienDbId]);
+
+    if (!useEscrow) return res.json({ ok: true, listingId, escrow: false });
+
+    const { buildEscrowDepositTx } = require("./nft/escrow");
+    const tx = await buildEscrowDepositTx({
+      rpcUrl: RPC_URL, mint: alien.nft_mint, sellerPubkey: wallet, escrowPubkey: ADMIN_WALLET,
+    });
+    const serialized = Buffer.from(
+      tx.serialize({ requireAllSignatures: false, verifySignatures: false })
+    ).toString("base64");
+    res.json({ ok: true, listingId, escrow: true, serialized });
+  } catch (e) {
+    console.error(e);
+    if (String(e?.message || "").includes("429")) {
+      return res.status(503).json({ error: "Devnet RPC is rate-limiting — wait ~10s and try again (or set a private RPC_URL in .env)" });
+    }
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Activate a pending-escrow listing once the NFT is verifiably held by escrow.
+app.post("/api/marketplace/confirm-list", requireAuth, marketLimiter, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const { listingId } = req.body || {};
+    const lr = await query(
+      `SELECT * FROM marketplace_listings WHERE id=$1 AND seller_wallet=$2 AND status='pending_escrow'`,
+      [listingId, wallet]
+    );
+    if (lr.rowCount === 0) return res.status(404).json({ error: "listing not found" });
+    const listing = lr.rows[0];
+
+    const { getNftOwner } = require("./nft/escrow");
+    const owner = await getNftOwner({ rpcUrl: RPC_URL, mint: listing.nft_mint });
+    if (owner !== ADMIN_WALLET) {
+      return res.status(400).json({ error: "NFT not in escrow yet — transfer not confirmed on-chain" });
+    }
+    await query(`UPDATE marketplace_listings SET status='active' WHERE id=$1`, [listingId]);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+app.post("/api/marketplace/unlist", requireAuth, marketLimiter, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const { listingId } = req.body || {};
+    if (!listingId) return res.status(400).json({ error: "missing listingId" });
+
+    const lr = await query(
+      `SELECT * FROM marketplace_listings
+       WHERE id=$1 AND seller_wallet=$2 AND status IN ('active','pending_escrow')`,
+      [listingId, wallet]
+    );
+    if (lr.rowCount === 0)
+      return res.status(404).json({ error: "listing not found or not yours" });
+    const listing = lr.rows[0];
+
+    // Escrowed NFT goes back to the seller before the listing is cancelled.
+    if (listing.nft_mint && !DEV_SKIP_SOL_VERIFY && ADMIN_WALLET && listing.status === "active") {
+      const { getNftOwner, sendNftFromEscrow } = require("./nft/escrow");
+      const owner = await getNftOwner({ rpcUrl: RPC_URL, mint: listing.nft_mint });
+      if (owner === ADMIN_WALLET) {
+        await sendNftFromEscrow({
+          rpcUrl: RPC_URL, mint: listing.nft_mint,
+          escrowKeypair: getDevKeypair(), toPubkey: wallet,
+        });
+      }
+    }
+
+    await query(
+      `UPDATE marketplace_listings SET status='cancelled' WHERE id=$1 AND status IN ('active','pending_escrow')`,
+      [listingId]
+    );
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+app.post("/api/marketplace/buy", requireAuth, marketLimiter, async (req, res) => {
+  try {
+    const buyerWallet = req.auth?.wallet;
+    const { listingId } = req.body || {};
+    if (!listingId) return res.status(400).json({ error: "missing listingId" });
+
+    const listingRow = await query(
+      `SELECT * FROM marketplace_listings WHERE id = $1 AND status = 'active'`, [listingId]
+    );
+    if (listingRow.rowCount === 0)
+      return res.status(404).json({ error: "listing not found" });
+    const listing = listingRow.rows[0];
+    if (listing.seller_wallet === buyerWallet)
+      return res.status(400).json({ error: "cannot buy your own listing" });
+
+    // On-chain listings must have the NFT sitting in escrow BEFORE anyone pays.
+    // The buyer pays the seller directly, so if we let them pay and the NFT
+    // release later fails, they're out the money with no NFT (the alien #139
+    // desync). Verify escrow holds it; if not, void the listing so it leaves Browse.
+    if (listing.nft_mint && !DEV_SKIP_SOL_VERIFY && ADMIN_WALLET) {
+      try {
+        const { getNftOwner } = require("./nft/escrow");
+        const owner = await getNftOwner({ rpcUrl: RPC_URL, mint: listing.nft_mint });
+        if (owner !== ADMIN_WALLET) {
+          await query(`UPDATE marketplace_listings SET status='cancelled' WHERE id=$1 AND status='active'`, [listingId]);
+          return res.status(409).json({ error: "This listing can't be fulfilled (its NFT isn't in escrow) — it has been removed." });
+        }
+      } catch (e) {
+        if (String(e?.message || "").includes("429"))
+          return res.status(503).json({ error: "Devnet RPC is rate-limiting — wait ~10s and try again." });
+        return res.status(502).json({ error: "Couldn't verify the NFT on-chain — try again in a moment." });
+      }
+    }
+
+    const lamports = Math.floor(Number(listing.price_sol) * 1e9);
+    const intentId = nanoid(24);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await query(
+      `INSERT INTO payment_intents (id, wallet, kind, price_usd, sol_usd, lamports, expires_at)
+       VALUES ($1,$2,$3,0,0,$4,$5)`,
+      [intentId, buyerWallet, `buy_listing:${listingId}`, String(lamports), expiresAt]
+    );
+
+    if (DEV_SKIP_SOL_VERIFY) {
+      return res.json({ devSkip: true, intentId, priceSol: listing.price_sol, lamports,
+        sellerWallet: listing.seller_wallet, listing, expiresAt: expiresAt.toISOString() });
+    }
+
+    const tx = await buildTransferTx({
+      rpcUrl: RPC_URL, fromPubkey: buyerWallet,
+      toPubkey: listing.seller_wallet, lamports,
+    });
+    const serialized = Buffer.from(
+      tx.serialize({ requireAllSignatures: false, verifySignatures: false })
+    ).toString("base64");
+
+    res.json({ serialized, intentId, priceSol: listing.price_sol, lamports,
+      sellerWallet: listing.seller_wallet, listing, expiresAt: expiresAt.toISOString() });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+app.post("/api/marketplace/confirm-buy", requireAuth, marketLimiter, async (req, res) => {
+  try {
+    const buyerWallet = req.auth?.wallet;
+    const { listingId, intentId, signature } = req.body || {};
+    if (!listingId || !intentId) return res.status(400).json({ error: "missing fields" });
+
+    const listingRow = await query(
+      `SELECT * FROM marketplace_listings WHERE id = $1 AND status = 'active'`, [listingId]
+    );
+    if (listingRow.rowCount === 0)
+      return res.status(404).json({ error: "listing not found or already sold" });
+    const listing = listingRow.rows[0];
+
+    const intentRow = await query(`SELECT * FROM payment_intents WHERE id = $1`, [intentId]);
+    if (intentRow.rowCount === 0) return res.status(400).json({ error: "invalid intent" });
+    const intent = intentRow.rows[0];
+    if (intent.wallet !== buyerWallet) return res.status(403).json({ error: "intent wallet mismatch" });
+    if (new Date(intent.expires_at).getTime() < Date.now()) return res.status(410).json({ error: "intent expired" });
+
+    if (!DEV_SKIP_SOL_VERIFY) {
+      if (!signature) return res.status(400).json({ error: "missing signature" });
+      const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [signature]);
+      if (already.rowCount > 0) return res.status(409).json({ error: "payment already processed" });
+      const verify = await verifySolPayment({
+        rpcUrl: RPC_URL, signature, expectedFrom: buyerWallet,
+        expectedTo: listing.seller_wallet, minLamports: Number(intent.lamports),
+      });
+      if (!verify.ok) return res.status(400).json({ error: "invalid payment", detail: verify });
+    }
+
+    await query(`INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO NOTHING`, [buyerWallet]);
+
+    await query("BEGIN");
+    try {
+      // Claim the listing first: the status='active' guard makes this atomic,
+      // so a second concurrent buyer rolls back here instead of double-selling.
+      const claimed = await query(
+        `UPDATE marketplace_listings SET status='sold', sold_at=now(), buyer_wallet=$1
+         WHERE id=$2 AND status='active'
+         RETURNING id`,
+        [buyerWallet, listingId]
+      );
+      if (claimed.rowCount === 0) {
+        await query("ROLLBACK");
+        return res.status(409).json({ error: "listing already sold" });
+      }
+      if (!DEV_SKIP_SOL_VERIFY && signature) {
+        await query(
+          `INSERT INTO payments (signature, wallet, kind, amount_sol, metadata) VALUES ($1,$2,$3,$4,$5)`,
+          [signature, buyerWallet, `buy_listing:${listingId}`,
+           Number(intent.lamports) / 1e9, JSON.stringify({ listingId, intentId })]
+        );
+      }
+      await query(`UPDATE aliens SET wallet = $1 WHERE id = $2`, [buyerWallet, listing.alien_db_id]);
+      await query(`DELETE FROM ship_slots WHERE alien_fk = $1`, [listing.alien_db_id]);
+      await query(`DELETE FROM payment_intents WHERE id=$1`, [intentId]);
+      await query("COMMIT");
+    } catch (e) { await query("ROLLBACK"); throw e; }
+
+    // Release the escrowed NFT to the buyer. The DB sale is already final;
+    // a transfer failure is logged for manual replay, not rolled back.
+    let nftTransfer = null;
+    if (listing.nft_mint && !DEV_SKIP_SOL_VERIFY && ADMIN_WALLET) {
+      const { sendNftFromEscrow } = require("./nft/escrow");
+      // Escrow was verified at buy time, so the NFT IS here — retry through
+      // transient RPC failures rather than stranding the buyer.
+      for (let attempt = 1; attempt <= 3 && !nftTransfer; attempt++) {
+        try {
+          nftTransfer = await sendNftFromEscrow({
+            rpcUrl: RPC_URL, mint: listing.nft_mint,
+            escrowKeypair: getDevKeypair(), toPubkey: buyerWallet,
+          });
+          console.log(`[escrow] NFT ${listing.nft_mint} -> ${buyerWallet} (${nftTransfer})`);
+        } catch (e) {
+          console.error(`[escrow] release attempt ${attempt}/3 failed listing#${listingId} mint=${listing.nft_mint}:`, e.message);
+          if (attempt < 3) await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+      if (!nftTransfer)
+        console.error(`[escrow] RELEASE STILL FAILED listing#${listingId} mint=${listing.nft_mint} buyer=${buyerWallet} — manual replay needed`);
+    }
+
+    res.json({ ok: true, alienDbId: listing.alien_db_id, nftTransfer });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+// ===================== END MARKETPLACE =====================
+
+// ===================== VOID ARENA (Realm IV) =====================
+// Real-time stakes arena (see arena/engine.js). Stakes and cashouts settle
+// against the ge_balances ledger; deposits arrive via the intent flow below.
+let arena = null;
+
+app.get("/api/v2/arena/stats", (_req, res) => {
+  if (!arena) return res.json({ ok: true, players: 0, total_bounty_sol: 0 });
+  res.json({ ok: true, ...arena.getStats() });
+});
+
+app.get("/api/v2/arena/leaderboard", (_req, res) => {
+  if (!arena || typeof arena.getLeaderboard !== "function") return res.json({ ok: true, leaderboard: [] });
+  res.json({ ok: true, leaderboard: arena.getLeaderboard(10) });
+});
+
+const ARENA_MIN_DEPOSIT_SOL = 0.05;
+const ARENA_MAX_DEPOSIT_SOL = 10;
+
+app.post("/api/v2/arena/deposit", requireAuth, arenaLimiter, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const sol = Number(req.body?.sol);
+    if (!Number.isFinite(sol) || sol < ARENA_MIN_DEPOSIT_SOL || sol > ARENA_MAX_DEPOSIT_SOL) {
+      return res.status(400).json({ error: `Deposit must be ${ARENA_MIN_DEPOSIT_SOL}–${ARENA_MAX_DEPOSIT_SOL} SOL` });
+    }
+    const lamports = Math.round(sol * 1e9);
+    const intentId = nanoid(24);
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await query(
+      `INSERT INTO payment_intents (id, wallet, kind, price_usd, sol_usd, lamports, expires_at)
+       VALUES ($1,$2,'arena_deposit',0,0,$3,$4)`,
+      [intentId, wallet, String(lamports), expiresAt]
+    );
+
+    if (DEV_SKIP_SOL_VERIFY) {
+      return res.json({ devSkip: true, intentId, lamports, expiresAt: expiresAt.toISOString() });
+    }
+    if (!ADMIN_WALLET) return res.status(500).json({ error: "Treasury not configured" });
+
+    const tx = await buildTransferTx({
+      rpcUrl: RPC_URL, fromPubkey: wallet, toPubkey: ADMIN_WALLET, lamports,
+    });
+    const serialized = Buffer.from(
+      tx.serialize({ requireAllSignatures: false, verifySignatures: false })
+    ).toString("base64");
+    res.json({ serialized, intentId, lamports, expiresAt: expiresAt.toISOString() });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+app.post("/api/v2/arena/confirm-deposit", requireAuth, arenaLimiter, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    const { intentId, signature } = req.body || {};
+    if (!intentId) return res.status(400).json({ error: "missing intentId" });
+
+    const ir = await query(`SELECT * FROM payment_intents WHERE id=$1 AND kind='arena_deposit'`, [intentId]);
+    if (ir.rowCount === 0) return res.status(400).json({ error: "invalid intent" });
+    const intent = ir.rows[0];
+    if (intent.wallet !== wallet) return res.status(403).json({ error: "intent wallet mismatch" });
+    if (new Date(intent.expires_at).getTime() < Date.now()) return res.status(410).json({ error: "intent expired" });
+
+    if (!DEV_SKIP_SOL_VERIFY) {
+      if (!signature) return res.status(400).json({ error: "missing signature" });
+      const already = await query(`SELECT signature FROM payments WHERE signature=$1`, [signature]);
+      if (already.rowCount > 0) return res.status(409).json({ error: "payment already processed" });
+      const verify = await verifySolPayment({
+        rpcUrl: RPC_URL, signature, expectedFrom: wallet,
+        expectedTo: ADMIN_WALLET, minLamports: Number(intent.lamports),
+      });
+      if (!verify.ok) return res.status(400).json({ error: "invalid payment" });
+    }
+
+    const sol = Number(intent.lamports) / 1e9;
+    await query(`INSERT INTO users (wallet) VALUES ($1) ON CONFLICT (wallet) DO NOTHING`, [wallet]);
+
+    await query("BEGIN");
+    try {
+      // Consume the intent atomically — a concurrent confirm with the same
+      // intent can't double-credit.
+      const used = await query(`DELETE FROM payment_intents WHERE id=$1 RETURNING id`, [intentId]);
+      if (used.rowCount === 0) {
+        await query("ROLLBACK");
+        return res.status(409).json({ error: "intent already used" });
+      }
+      if (!DEV_SKIP_SOL_VERIFY && signature) {
+        await query(
+          `INSERT INTO payments (signature, wallet, kind, amount_sol, metadata) VALUES ($1,$2,'arena_deposit',$3,$4)`,
+          [signature, wallet, sol, JSON.stringify({ intentId })]
+        );
+      }
+      await query(
+        `INSERT INTO ge_balances (wallet, balance) VALUES ($1,$2)
+         ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + EXCLUDED.balance, updated_at=NOW()`,
+        [wallet, sol]
+      );
+      await query("COMMIT");
+    } catch (e) { await query("ROLLBACK"); throw e; }
+
+    res.json({ ok: true, credited: sol });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+// Withdraw arena/GE balance to the user's wallet as real SOL (dev wallet pays).
+app.post("/api/v2/arena/withdraw", requireAuth, payoutLimiter, async (req, res) => {
+  try {
+    const wallet = req.auth?.wallet;
+    if (!isProbableSolanaAddress(wallet)) {
+      return res.status(400).json({ error: "Withdrawals require a real Solana wallet (not guest mode)" });
+    }
+    const sol = Number(req.body?.sol);
+    const maxWithdraw = Number(process.env.MAX_ARENA_WITHDRAW_SOL || 5);
+    if (!Number.isFinite(sol) || sol < 0.01 || sol > maxWithdraw) {
+      return res.status(400).json({ error: `Withdraw must be 0.01–${maxWithdraw} SOL` });
+    }
+
+    // Debit the ledger atomically BEFORE sending — a concurrent withdraw
+    // can't double-spend the same balance.
+    const debit = await query(
+      `UPDATE ge_balances SET balance = balance - $2, updated_at = NOW()
+       WHERE wallet = $1 AND balance >= $2 RETURNING balance`,
+      [wallet, sol]
+    );
+    if (debit.rowCount === 0) return res.status(400).json({ error: "Insufficient balance" });
+
+    const lamports = Math.round(sol * 1e9);
+    let signature;
+    try {
+      signature = await sendSolPayout({ rpcUrl: RPC_URL, toPubkey: wallet, lamports });
+    } catch (e) {
+      console.error("arena withdraw payout failed", wallet, sol, e);
+      // Restore the ledger; do NOT auto-retry (the tx may have landed).
+      await query(
+        `UPDATE ge_balances SET balance = balance + $2, updated_at = NOW() WHERE wallet = $1`,
+        [wallet, sol]
+      ).catch(() => {});
+      return res.status(502).json({ error: "Payout failed. Balance restored — try again later." });
+    }
+
+    res.json({ ok: true, signature, withdrawn: sol, balance: Number(debit.rows[0].balance) });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+// Dev faucet so guest wallets can try the arena without real SOL.
+app.post("/api/v2/arena/dev-topup", requireAuth, arenaLimiter, async (req, res) => {
+  try {
+    if (process.env.DEV_GUEST_AUTH !== "1") return res.status(403).json({ error: "disabled" });
+    const wallet = req.auth?.wallet;
+    await query(
+      `INSERT INTO ge_balances (wallet, balance) VALUES ($1, 1)
+       ON CONFLICT (wallet) DO UPDATE SET balance = ge_balances.balance + 1, updated_at=NOW()`,
+      [wallet]
+    );
+    const r = await query(`SELECT balance FROM ge_balances WHERE wallet=$1`, [wallet]);
+    res.json({ ok: true, balance: Number(r.rows[0].balance) });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Internal server error" }); }
+});
+
+// ===================== END VOID ARENA =====================
+
 initDb()
   .then(() => {
-    app.listen(PORT, () => console.log(`✅ Zeruva API running on ${PORT}`));
+    const server = app.listen(PORT, () => console.log(`✅ Zeruva API running on ${PORT}`));
+    try {
+      const { initArena } = require("./arena/engine");
+      arena = initArena({
+        httpServer: server,
+        isAllowedOrigin,
+        jwt,
+        jwtSecret: JWT_SECRET,
+        query,
+        devGuest: () => process.env.DEV_GUEST_AUTH === "1",
+        alienCount: ALIEN_COUNT,
+        devFeeWallet: ADMIN_WALLET || "__dev__",
+      });
+    } catch (e) {
+      console.error("⚠️  Void Arena failed to start", e);
+    }
     startGreatExpeditionSimulator();
   })
   .catch((err) => {
