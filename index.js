@@ -1079,7 +1079,7 @@ app.post("/api/auth/verify", authVerifyLimiter, async (req, res) => {
     await query(`DELETE FROM auth_nonces WHERE wallet=$1`, [wallet]);
 
     const token = jwt.sign({ wallet }, JWT_SECRET, { expiresIn: "7d" });
-    return res.json({ token, wallet, expires_in: "12h" });
+    return res.json({ token, wallet, expires_in: "7d" });
   } catch (e) {
     return res.status(400).json({ error: "Bad signature format" });
   }
