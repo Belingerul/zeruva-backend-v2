@@ -165,6 +165,21 @@ app.use(
 );
 
 app.use(express.json({ limit: "1mb" }));
+
+// ── Request logging ("log it all") ────────────────────────────────────────
+// One structured access line per request: method, path, status, duration, and
+// the authenticated wallet (when present). Static asset noise is skipped.
+// Dependency-free on purpose — no morgan/pino install to keep the surface small.
+app.use((req, res, next) => {
+  if (req.path.startsWith("/static") || req.path.startsWith("/api/static")) return next();
+  const start = process.hrtime.bigint();
+  res.on("finish", () => {
+    const ms = Number(process.hrtime.bigint() - start) / 1e6;
+    const who = req.auth?.wallet ? ` wallet=${String(req.auth.wallet).slice(0, 8)}…` : "";
+    console.log(`[req] ${req.method} ${req.path} ${res.statusCode} ${ms.toFixed(1)}ms${who}`);
+  });
+  next();
+});
 app.use("/static", express.static(path.join(__dirname, "public")));
 // Allow frontend to load images through Next.js /api rewrite (tunnel-friendly)
 app.use("/api/static", express.static(path.join(__dirname, "public")));
@@ -273,6 +288,13 @@ async function getNonce(wallet) {
   return nonce;
 }
 
+// ── Row-level access control ──────────────────────────────────────────────
+// RLS protocol: access to a user's rows is enforced at the application layer —
+// requireAuth resolves the caller's wallet from a verified JWT (never from
+// client-supplied body/query in prod), and every per-user query is scoped
+// `WHERE wallet = $1` with that value. The DB uses a single service role, so
+// Postgres-native RLS policies aren't used; the wallet from the token is the
+// single source of identity, applied uniformly across reads and writes.
 function requireAuth(req, res, next) {
   // Dev convenience: allow "guest" wallets for local testing without Phantom/signatures.
   // Enable explicitly: DEV_GUEST_AUTH=1
@@ -1079,7 +1101,7 @@ app.post("/api/auth/verify", authVerifyLimiter, async (req, res) => {
     await query(`DELETE FROM auth_nonces WHERE wallet=$1`, [wallet]);
 
     const token = jwt.sign({ wallet }, JWT_SECRET, { expiresIn: "7d" });
-    return res.json({ token, wallet, expires_in: "12h" });
+    return res.json({ token, wallet, expires_in: "7d" });
   } catch (e) {
     return res.status(400).json({ error: "Bad signature format" });
   }
@@ -1969,12 +1991,20 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
+// Defense-in-depth for the commit–reveal: the round's secret (seed_reveal) must
+// never travel in the object that read endpoints serialize. Strip it on every
+// read; settleRound loads it straight from the DB at the moment it needs it.
+function stripSecret(round) {
+  if (round) delete round.seed_reveal;
+  return round;
+}
+
 async function getCurrentRound() {
   // Include 'settled' so the frontend can see the result and animate.
   const r = await query(
     `SELECT * FROM ge_rounds WHERE status IN ('filling','running','settled') ORDER BY id DESC LIMIT 1`
   );
-  return r.rows[0] || null;
+  return stripSecret(r.rows[0]) || null;
 }
 
 async function getRoundStats(roundId, { excludeBots = false } = {}) {
@@ -2000,7 +2030,7 @@ async function getRoundStats(roundId, { excludeBots = false } = {}) {
 // pointless empty rounds from spinning + settling when nobody is playing.
 async function maybeStartRound(roundId) {
   const cur = await query(`SELECT * FROM ge_rounds WHERE id=$1`, [roundId]);
-  const r = cur.rows[0];
+  const r = stripSecret(cur.rows[0]);
   if (!r || r.status !== "filling") return r || null;
   const real = await getRoundStats(roundId, { excludeBots: true });
   if (real.totalEntries <= 0) return r; // still waiting for players
@@ -2011,7 +2041,7 @@ async function maybeStartRound(roundId) {
      WHERE id=$1 AND status='filling' RETURNING *`,
     [roundId, endsAt]
   );
-  return upd.rows[0] || r;
+  return stripSecret(upd.rows[0]) || r;
 }
 
 app.get("/api/v2/ge/round/current", async (_req, res) => {
@@ -2391,7 +2421,10 @@ async function settleRound(round) {
 
   // Commit–reveal style seed: round has a secret (seed_reveal) stored server-side.
   // We never expose seed_reveal; clients may see seed_commit for audit.
-  const secret = round.seed_reveal || crypto.randomBytes(32).toString("hex");
+  // Load the committed secret directly from the DB (it's stripped from the round
+  // objects the read paths hand around). Same value as before — behavior unchanged.
+  const secretRow = await query(`SELECT seed_reveal FROM ge_rounds WHERE id=$1`, [round.id]);
+  const secret = secretRow.rows[0]?.seed_reveal || crypto.randomBytes(32).toString("hex");
   const seed = crypto
     .createHash("sha256")
     .update(`${secret}:${round.id}:${endsAt.toISOString()}:${stats.totalEntries}`)
@@ -2472,7 +2505,11 @@ async function settleRound(round) {
       );
     }
 
-    // Participation payouts
+    // Participation payouts. N+1 note: these per-wallet writes run once per
+    // round, inside one transaction, over a bounded set of real participants —
+    // not a per-request hot path. Not batched on purpose: a wallet can be both
+    // participant and winner, and ON CONFLICT can't touch the same row twice in
+    // one multi-row upsert. Read paths use JOINs, so no request-time N+1 exists.
     for (const p of participants.rows) {
       const q = Number(p.qty);
       if (q <= 0 || partTotalQty <= 0) continue;
@@ -2576,7 +2613,7 @@ app.get("/api/v2/ge/round/summary", async (req, res) => {
     const r = roundIdParam
       ? await query(`SELECT * FROM ge_rounds WHERE id=$1 AND status='settled' LIMIT 1`, [roundIdParam])
       : await query(`SELECT * FROM ge_rounds WHERE status='settled' ORDER BY id DESC LIMIT 1`);
-    const round = r.rows[0];
+    const round = stripSecret(r.rows[0]);
     if (!round) return res.json({ ok: true, round: null });
 
     // Money figures must mirror settleRound: real (non-bot) entries only.

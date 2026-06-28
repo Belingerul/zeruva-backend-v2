@@ -243,7 +243,14 @@ function initArena({ httpServer, isAllowedOrigin, jwt, jwtSecret, query, devGues
   });
 
   // ===== Game loop =====
+  // Guard against overlapping ticks: setInterval doesn't wait for the async
+  // callback, so a slow DB await (credit/debit) could let the next tick run
+  // concurrently with this one. Skip a tick rather than overlap.
+  let ticking = false;
   setInterval(async () => {
+    if (ticking) return;
+    ticking = true;
+    try {
     const dt = TICK_MS / 1000;
     const now = Date.now();
 
@@ -338,6 +345,9 @@ function initArena({ httpServer, isAllowedOrigin, jwt, jwtSecret, query, devGues
         await removeAndCredit(p, p.bounty - fee, "disconnect-cashout");
         creditDevFee(fee).catch(() => {});
       }
+    }
+    } finally {
+      ticking = false;
     }
   }, TICK_MS);
 
