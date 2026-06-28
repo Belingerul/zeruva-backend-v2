@@ -301,6 +301,7 @@ async function initDb() {
       nft_mint TEXT,
       obtained_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE INDEX IF NOT EXISTS aliens_wallet_idx ON aliens(wallet);
   `);
 
   // 3) which alien is placed in which ship slot
@@ -311,6 +312,7 @@ async function initDb() {
       slot_index INTEGER NOT NULL,
       alien_fk INTEGER REFERENCES aliens(id)
     );
+    CREATE INDEX IF NOT EXISTS ship_slots_alien_fk_idx ON ship_slots(alien_fk);
   `);
 
   // 3a) ensure UNIQUE(wallet, slot_index) for ON CONFLICT (wallet, slot_index)
@@ -462,6 +464,8 @@ async function initDb() {
       sold_at       TIMESTAMPTZ,
       buyer_wallet  TEXT
     );
+    CREATE INDEX IF NOT EXISTS marketplace_listings_status_idx ON marketplace_listings(status);
+    CREATE INDEX IF NOT EXISTS marketplace_listings_seller_idx ON marketplace_listings(seller_wallet);
   `);
 
   console.log("✅ Database tables ensured/created");
